@@ -1418,6 +1418,9 @@ alloc:
 
 void f2fs_do_map_lock(struct f2fs_sb_info *sbi, int flag, bool lock)
 {
+	if (lock)
+		f2fs_down_read(&sbi->cp_enable_rwsem);
+
 	if (flag == F2FS_GET_BLOCK_PRE_AIO) {
 		if (lock)
 			f2fs_down_read(&sbi->node_change);
@@ -1429,6 +1432,9 @@ void f2fs_do_map_lock(struct f2fs_sb_info *sbi, int flag, bool lock)
 		else
 			f2fs_unlock_op(sbi);
 	}
+
+	if (!lock)
+		f2fs_up_read(&sbi->cp_enable_rwsem);
 }
 
 /*
