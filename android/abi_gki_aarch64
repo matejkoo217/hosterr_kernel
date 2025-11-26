@@ -144,3 +144,4 @@
 
 # preserved by --additions-only
   android_kmalloc_64_create
+task_is_booster
