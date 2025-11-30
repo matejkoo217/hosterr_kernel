@@ -1,0 +1,149 @@
+name: Build GKI with KernelSU
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Source
+      uses: actions/checkout@v3
+      with:
+        path: android_gki_kernel_5.15_common
+
+    - name: Free Disk Space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf "/usr/local/share/boost"
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git zip unzip curl wget python3 bc rsync schedtool cpio ncurses-dev libxml2-utils inetutils-ping build-essential python3-pip
+        
+        # Install mkbootimg
+        sudo pip3 install mkbootimg
+
+        # Install Repo
+        mkdir -p ~/.bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+        chmod a+rx ~/.bin/repo
+        echo "$HOME/.bin" >> $GITHUB_PATH
+
+    - name: Setup Build Environment
+      run: |
+        mkdir -p gki_build_workspace
+        cd gki_build_workspace
+        
+        # Configure Git
+        git config --global user.name "GitHub Action"
+        git config --global user.email "action@github.com"
+        
+        # Initialize repo with depth 1 to save time and space
+        repo init -u https://android.googlesource.com/kernel/manifest -b common-android13-5.15 --depth=1
+        
+        mkdir -p .repo/local_manifests
+        # Remove the default kernel/common to replace with ours
+        cat > .repo/local_manifests/local.xml <<EOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <manifest>
+            <remove-project name="kernel/common" />
+        </manifest>
+        EOF
+        
+        # Sync only necessary parts
+        repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+
+    - name: Link Kernel Source
+      run: |
+        cd gki_build_workspace
+        ln -s $GITHUB_WORKSPACE/android_gki_kernel_5.15_common common
+
+    - name: Apply Fixes & Configs
+      run: |
+        cd gki_build_workspace
+        KERNEL_SRC="common"
+        
+        # 1. ZRAM Fix
+        GKI_DEFCONFIG="$KERNEL_SRC/arch/arm64/configs/gki_defconfig"
+        if grep -q "CONFIG_ZRAM=y" "$GKI_DEFCONFIG"; then
+            sed -i 's/CONFIG_ZRAM=y/CONFIG_ZRAM=m/' "$GKI_DEFCONFIG"
+            sed -i 's/CONFIG_ZSMALLOC=y/CONFIG_ZSMALLOC=m/' "$GKI_DEFCONFIG"
+        fi
+        
+        MODULES_LIST="$KERNEL_SRC/android/gki_system_dlkm_modules"
+        if ! grep -q "drivers/block/zram/zram.ko" "$MODULES_LIST"; then
+            echo "drivers/block/zram/zram.ko" >> "$MODULES_LIST"
+            echo "mm/zsmalloc.ko" >> "$MODULES_LIST"
+        fi
+
+        # 2. Export task_is_booster
+        CPUSET_C="$KERNEL_SRC/kernel/cgroup/cpuset.c"
+        if ! grep -q "EXPORT_SYMBOL_GPL(task_is_booster)" "$CPUSET_C"; then
+            echo "" >> "$CPUSET_C"
+            echo "EXPORT_SYMBOL_GPL(task_is_booster);" >> "$CPUSET_C"
+        fi
+
+        # 3. Update KMI Symbol List
+        SYMBOL_LIST="$KERNEL_SRC/android/abi_gki_aarch64"
+        if ! grep -q "task_is_booster" "$SYMBOL_LIST"; then
+            echo "task_is_booster" >> "$SYMBOL_LIST"
+        fi
+        
+        # 4. Patch stamp.bzl to remove -maybe-dirty
+        STAMP_BZL="build/kernel/kleaf/impl/stamp.bzl"
+        if [ -f "$STAMP_BZL" ]; then
+            sed -i 's/export LOCALVERSION="-maybe-dirty"/export LOCALVERSION=""/' "$STAMP_BZL"
+        fi
+
+    - name: Setup KernelSU
+      run: |
+        cd gki_build_workspace/common
+        # Run the official setup script to install/update KernelSU
+        # This will fetch the latest KernelSU and patch the kernel if needed
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+
+    - name: Build Kernel
+      run: |
+        cd gki_build_workspace
+        # Build command
+        tools/bazel build //common:kernel_aarch64_dist --config=fast
+
+    - name: Package Kernel
+      run: |
+        cd gki_build_workspace
+        
+        # Find the built Image
+        KERNEL_IMAGE=$(find out/ -name Image | head -n 1)
+        echo "Found Kernel Image: $KERNEL_IMAGE"
+        
+        # 1. Create boot.img
+        # GKI usually uses header version 4
+        mkbootimg --kernel "$KERNEL_IMAGE" --header_version 4 --output boot.img
+        echo "Created boot.img"
+        
+        # 2. Create AnyKernel3.zip
+        git clone https://github.com/osm0sis/AnyKernel3
+        rm -rf AnyKernel3/.git
+        cp "$KERNEL_IMAGE" AnyKernel3/
+        
+        # Create zip
+        cd AnyKernel3
+        zip -r9 ../AnyKernel3.zip * -x .git README.md *placeholder
+        cd ..
+        echo "Created AnyKernel3.zip"
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: Kernel-Images
+        path: |
+          gki_build_workspace/out/**/dist/Image
+          gki_build_workspace/boot.img
+          gki_build_workspace/AnyKernel3.zip
