@@ -373,7 +373,6 @@ static const struct usb_device_id usb_quirk_list[] = {
 	/* SanDisk Extreme 55AE */
 	{ USB_DEVICE(0x0781, 0x55ae), .driver_info = USB_QUIRK_NO_LPM },
 
->>>>>>> upstream/android13-5.15-2025-09
 	/* Realforce 87U Keyboard */
 	{ USB_DEVICE(0x0853, 0x011b), .driver_info = USB_QUIRK_NO_LPM },
 

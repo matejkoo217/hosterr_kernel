@@ -472,7 +472,7 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
 	unsigned long rsslim = 0;
 	unsigned long flags;
 	struct signal_struct *sig;
-	unsigned int seq;
+	unsigned int seq = 0;
 
 	state = *get_task_state(task);
 	vsize = eip = esp = 0;
