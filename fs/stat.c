@@ -199,17 +199,12 @@ int vfs_fstat(int fd, struct kstat *stat)
  *
  * 0 will be returned on success, and a -ve error code if unsuccessful.
  */
-extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags,
-			   struct kstat *stat, u32 *request_mask);
-
 static int vfs_statx(int dfd, const char __user *filename, int flags,
 	      struct kstat *stat, u32 request_mask)
 {
 	struct path path;
 	unsigned lookup_flags = 0;
 	int error;
-
-	ksu_handle_stat(&dfd, &filename, &flags, stat, &request_mask);
 
 	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH |
 		      AT_STATX_SYNC_TYPE))

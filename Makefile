@@ -1029,6 +1029,13 @@ endif
 # Limit inlining across translation units to reduce binary size
 KBUILD_LDFLAGS += -mllvm -import-instr-limit=5
 
+# Enable LLD multi-threading for faster linking
+KBUILD_LDFLAGS += --threads=$(shell nproc)
+ifdef CONFIG_LTO_CLANG_THIN
+# Enable ThinLTO parallel jobs (only for ThinLTO)
+KBUILD_LDFLAGS += --thinlto-jobs=$(shell nproc)
+endif
+
 # Check for frame size exceeding threshold during prolog/epilog insertion
 # when using lld < 13.0.0.
 ifneq ($(CONFIG_FRAME_WARN),0)
