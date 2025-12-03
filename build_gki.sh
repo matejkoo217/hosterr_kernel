@@ -242,7 +242,16 @@ tools/bazel build //common:kernel_aarch64_dist
 stop_temp_monitor
 
 log "Build Complete!"
-IMAGE_PATH=$(find out/ -name Image | head -n 1)
+# Find Image in workspace out directory (Bazel output)
+IMAGE_PATH=$(find "$WORKSPACE_DIR/out" -name Image 2>/dev/null | head -n 1)
+if [ -z "$IMAGE_PATH" ]; then
+    # Try alternative locations
+    IMAGE_PATH=$(find "$WORKSPACE_DIR" -name Image -path "*/out/*" 2>/dev/null | head -n 1)
+fi
+if [ -z "$IMAGE_PATH" ]; then
+    error "Could not find built Kernel Image in $WORKSPACE_DIR"
+    exit 1
+fi
 echo "Kernel Image: $IMAGE_PATH"
 
 # Verify version
@@ -250,3 +259,220 @@ log "Verifying Kernel Version..."
 if [ -f "$IMAGE_PATH" ]; then
     strings "$IMAGE_PATH" | grep "Linux version" | head -n 1
 fi
+
+# ==============================================================================
+# POST-BUILD: Generate Output Artifacts
+# ==============================================================================
+log "Generating build artifacts..."
+
+# Get script directory (kernel source root)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_DIR="$SCRIPT_DIR/out"
+
+# Create output directory
+mkdir -p "$OUT_DIR"
+log "Output directory: $OUT_DIR"
+
+# 1. Generate Image.gz
+log "Creating Image.gz..."
+cp "$IMAGE_PATH" "$OUT_DIR/Image"
+gzip -f "$OUT_DIR/Image"
+log "✓ Image.gz created: $OUT_DIR/Image.gz"
+
+# 2. Generate boot.img
+log "Creating boot.img..."
+BOOT_IMG="$OUT_DIR/boot.img"
+
+# Check if mkbootimg is available
+if ! command -v mkbootimg &> /dev/null; then
+    warn "mkbootimg not found. Trying to use from Android build tools..."
+    # Try to find mkbootimg in common Android locations
+    if [ -f "$WORKSPACE_DIR/prebuilts/misc/linux-x86/libufdt/mkbootimg.py" ]; then
+        MKBOOTIMG_CMD="python3 $WORKSPACE_DIR/prebuilts/misc/linux-x86/libufdt/mkbootimg.py"
+    else
+        error "mkbootimg not found. Please install Android build tools or set up mkbootimg."
+        exit 1
+    fi
+else
+    MKBOOTIMG_CMD="mkbootimg"
+fi
+
+# Create boot.img with header version 4 (GKI Android 13)
+$MKBOOTIMG_CMD \
+    --kernel "$IMAGE_PATH" \
+    --header_version 4 \
+    --output "$BOOT_IMG"
+
+# Add AVB hash footer if avbtool is available
+if command -v avbtool &> /dev/null; then
+    log "Adding AVB hash footer..."
+    IMAGE_SIZE=$(stat -c%s "$BOOT_IMG")
+    PADDING=$((2 * 1024 * 1024))  # 2MB
+    PARTITION_SIZE=$((IMAGE_SIZE + PADDING))
+    avbtool add_hash_footer \
+        --image "$BOOT_IMG" \
+        --partition_name boot \
+        --partition_size "$PARTITION_SIZE"
+    log "✓ AVB footer added"
+else
+    warn "avbtool not found. boot.img created without AVB footer."
+fi
+
+log "✓ boot.img created: $BOOT_IMG"
+
+# 3. Generate anykernel.zip
+log "Creating anykernel.zip..."
+ANYKERNEL_DIR="$OUT_DIR/anykernel_tmp"
+rm -rf "$ANYKERNEL_DIR"
+mkdir -p "$ANYKERNEL_DIR/META-INF/com/google/android"
+
+# Create update-binary script for AnyKernel
+cat > "$ANYKERNEL_DIR/META-INF/com/google/android/update-binary" <<'EOF'
+#!/sbin/sh
+# AnyKernel installer script for GKI kernel
+
+OUTFD=$2
+ZIPFILE=$3
+
+ui_print() {
+    echo "ui_print $1" >&$OUTFD
+    echo "ui_print" >&$OUTFD
+}
+
+ui_print " "
+ui_print "AnyKernel GKI Kernel Installer"
+ui_print " "
+
+# Extract kernel image
+ui_print "Extracting kernel..."
+TMPDIR=/tmp/anykernel_$$
+mkdir -p "$TMPDIR"
+cd "$TMPDIR"
+unzip -o "$ZIPFILE" "Image" || {
+    ui_print "Error: Failed to extract Image from zip"
+    exit 1
+}
+
+if [ ! -f "$TMPDIR/Image" ]; then
+    ui_print "Error: Image not found in zip"
+    exit 1
+fi
+
+# Try to use magiskboot if available (most reliable method)
+if command -v magiskboot &> /dev/null; then
+    ui_print "Using magiskboot to repack boot image..."
+    
+    # Find boot partition
+    BOOT_PARTITION=$(find /dev/block -name boot 2>/dev/null | head -n 1)
+    if [ -z "$BOOT_PARTITION" ]; then
+        for name in boot /dev/block/bootdevice/by-name/boot /dev/block/by-name/boot; do
+            if [ -e "$name" ]; then
+                BOOT_PARTITION="$name"
+                break
+            fi
+        done
+    fi
+    
+    if [ -z "$BOOT_PARTITION" ] || [ ! -e "$BOOT_PARTITION" ]; then
+        ui_print "Error: Boot partition not found"
+        exit 1
+    fi
+    
+    ui_print "Backing up boot partition..."
+    dd if="$BOOT_PARTITION" of="$TMPDIR/boot.img" bs=4096 || {
+        ui_print "Error: Failed to read boot partition"
+        exit 1
+    }
+    
+    ui_print "Unpacking boot image..."
+    magiskboot unpack "$TMPDIR/boot.img" || {
+        ui_print "Error: Failed to unpack boot image"
+        exit 1
+    }
+    
+    ui_print "Replacing kernel..."
+    cp "$TMPDIR/Image" "$TMPDIR/kernel" || {
+        ui_print "Error: Failed to copy kernel"
+        exit 1
+    }
+    
+    ui_print "Repacking boot image..."
+    magiskboot repack "$TMPDIR/boot.img" "$TMPDIR/boot_new.img" || {
+        ui_print "Error: Failed to repack boot image"
+        exit 1
+    }
+    
+    ui_print "Flashing new boot image..."
+    dd if="$TMPDIR/boot_new.img" of="$BOOT_PARTITION" bs=4096 || {
+        ui_print "Error: Failed to write boot partition"
+        exit 1
+    }
+    
+    ui_print " "
+    ui_print "Kernel flashed successfully!"
+    rm -rf "$TMPDIR"
+    exit 0
+fi
+
+# Fallback: Try to use AIK (Android Image Kitchen) if available
+if [ -d "/tmp/AIK" ] || [ -d "/data/local/tmp/AIK" ]; then
+    AIK_DIR="/tmp/AIK"
+    [ -d "/data/local/tmp/AIK" ] && AIK_DIR="/data/local/tmp/AIK"
+    
+    ui_print "Using Android Image Kitchen..."
+    # AIK method would go here
+    ui_print "AIK method not fully implemented"
+fi
+
+# Final fallback: Direct flash (risky, device-specific)
+ui_print "Warning: Using direct flash method (may not work on all devices)"
+ui_print "This method is device-specific and may cause bootloop!"
+
+BOOT_PARTITION=$(find /dev/block -name boot 2>/dev/null | head -n 1)
+if [ -z "$BOOT_PARTITION" ]; then
+    BOOT_PARTITION="/dev/block/bootdevice/by-name/boot"
+fi
+
+if [ ! -e "$BOOT_PARTITION" ]; then
+    ui_print "Error: Boot partition not found"
+    ui_print "Please use magiskboot or AIK method"
+    exit 1
+fi
+
+ui_print "Direct flashing kernel (offset may vary by device)..."
+# This is device-specific and may need adjustment
+dd if="$TMPDIR/Image" of="$BOOT_PARTITION" bs=4096 seek=2048 conv=notrunc || {
+    ui_print "Error: Direct flash failed"
+    ui_print "Please use a recovery with magiskboot support"
+    exit 1
+}
+
+ui_print " "
+ui_print "Kernel flashed (direct method)"
+ui_print "If device doesn't boot, restore from backup!"
+
+rm -rf "$TMPDIR"
+EOF
+
+chmod +x "$ANYKERNEL_DIR/META-INF/com/google/android/update-binary"
+
+# Copy kernel image to anykernel directory
+cp "$IMAGE_PATH" "$ANYKERNEL_DIR/Image"
+
+# Create anykernel.zip
+cd "$ANYKERNEL_DIR"
+zip -r "$OUT_DIR/anykernel.zip" . > /dev/null
+cd "$SCRIPT_DIR"
+rm -rf "$ANYKERNEL_DIR"
+
+log "✓ anykernel.zip created: $OUT_DIR/anykernel.zip"
+
+# Summary
+echo ""
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}Build Artifacts Generated:${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo -e "  ${CYAN}Image.gz:${NC}      $OUT_DIR/Image.gz"
+echo -e "  ${CYAN}boot.img:${NC}      $BOOT_IMG"
+echo -e "  ${CYAN}anykernel.zip:${NC} $OUT_DIR/anykernel.zip"
+echo -e "${GREEN}========================================${NC}"
