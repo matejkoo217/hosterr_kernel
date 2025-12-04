@@ -1,8 +1,12 @@
-name: Build GKI with KernelSU
+name: Build GKI Kernel
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
+  push:
+    branches:
+      - copilot/create-workflow-script-for-kernel
+  pull_request:
+    branches:
+      - copilot/create-workflow-script-for-kernel
   workflow_dispatch:
 
 jobs:
@@ -49,17 +53,17 @@ jobs:
         chmod a+rx ~/.bin/repo
         echo "$HOME/.bin" >> $GITHUB_PATH
 
-    - name: Run Build Script (with KernelSU)
+    - name: Run Build Script
       run: |
         cd android_gki_kernel_5.15_common
         chmod +x build_gki.sh
-        # 运行构建脚本，启用 KernelSU 支持
-        ./build_gki.sh --ksu
+        # 运行构建脚本，它会自动处理环境设置、配置修复、构建和打包
+        ./build_gki.sh
 
     - name: Upload Kernel Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: GKI-Kernel-5.15-KernelSU
+        name: GKI-Kernel-5.15
         path: |
           android_gki_kernel_5.15_common/out/*
         retention-days: 30

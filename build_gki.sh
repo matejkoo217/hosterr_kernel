@@ -18,6 +18,7 @@ source "$LIB_DIR/config_fixes.sh"
 source "$LIB_DIR/workspace.sh"
 source "$LIB_DIR/version.sh"
 source "$LIB_DIR/ccache.sh"
+source "$LIB_DIR/ksu.sh"
 
 # ==============================================================================
 # ARGUMENT PARSING
@@ -25,17 +26,20 @@ source "$LIB_DIR/ccache.sh"
 SKIP_BUILD=false
 PACK_AK3=false
 PACK_IMG=false
+ENABLE_KSU=false
 
 show_usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
+    echo "  --ksu          Enable KernelSU support"
     echo "  --ak3          Only pack anykernel.zip (skip build)"
     echo "  --img          Only pack boot.img and Image.gz (skip build)"
     echo "  --help, -h     Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0              # Full build and pack all artifacts"
+    echo "  $0 --ksu        # Build with KernelSU"
     echo "  $0 --ak3       # Only pack anykernel.zip (requires existing build)"
     echo "  $0 --img       # Only pack boot.img and Image.gz (requires existing build)"
     exit 0
@@ -44,6 +48,10 @@ show_usage() {
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --ksu)
+            ENABLE_KSU=true
+            shift
+            ;;
         --ak3)
             PACK_AK3=true
             SKIP_BUILD=true
@@ -82,6 +90,11 @@ setup_workspace
 
 # 3. Apply Configuration Fixes
 apply_config_fixes
+
+# 3.1 Setup KernelSU (if enabled)
+if [ "$ENABLE_KSU" = true ]; then
+    setup_kernelsu
+fi
 
 # 4. Version Customization
 customize_version
@@ -132,7 +145,7 @@ if [ "$SKIP_BUILD" = false ]; then
     stop_temp_monitor
     
     # Restore .config file if it was moved
-    SOURCE_DIR="$(realpath ../android_gki_kernel_5.15_common)"
+    SOURCE_DIR="$REPO_ROOT"
     CONFIG_BACKUP="$SOURCE_DIR/.config.build_backup"
     if [ -f "$CONFIG_BACKUP" ]; then
         log "Restoring .config file..."

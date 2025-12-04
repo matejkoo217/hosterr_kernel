@@ -4,8 +4,8 @@
 # ==============================================================================
 
 # Source common functions
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/common.sh"
+MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$MODULE_DIR/common.sh"
 
 # Apply all configuration fixes
 apply_config_fixes() {
@@ -48,6 +48,27 @@ apply_config_fixes() {
     if ! grep -q "task_is_booster" "$SYMBOL_LIST"; then
         log "Updating KMI Symbol List..."
         echo "task_is_booster" >> "$SYMBOL_LIST"
+    fi
+
+    # Fix: Patch stamp.bzl to remove -maybe-dirty suffix and enable custom timestamp
+    if [ -f "$STAMP_BZL" ]; then
+        log "Patching stamp.bzl..."
+        # Remove -maybe-dirty suffix
+        sed -i 's/export LOCALVERSION="-maybe-dirty"/export LOCALVERSION=""/' "$STAMP_BZL"
+        
+        # Inject current timestamp into stamp.bzl
+        # We replace 'export SOURCE_DATE_EPOCH=0' (or 'true' from previous fix) with the actual timestamp
+        # This ensures the build uses the correct time instead of 1970-01-01
+        CURRENT_EPOCH=$(date +%s)
+        
+        # Try replacing the original line
+        sed -i "s/export SOURCE_DATE_EPOCH=0/export SOURCE_DATE_EPOCH=${CURRENT_EPOCH}/" "$STAMP_BZL"
+        
+        # Try replacing 'true' (if previous fix was applied)
+        # We match the indentation to be safe
+        sed -i "s/              true/              export SOURCE_DATE_EPOCH=${CURRENT_EPOCH}/" "$STAMP_BZL"
+        
+        log "✓ stamp.bzl patched (removed -maybe-dirty, injected timestamp ${CURRENT_EPOCH})"
     fi
     
     log "Configuration fixes applied."
