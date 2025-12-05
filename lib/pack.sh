@@ -49,7 +49,11 @@ pack_image_artifacts() {
     BOOT_IMG="$OUT_DIR/boot.img"
     
     # Check if mkbootimg is available
-    if ! command -v mkbootimg &> /dev/null; then
+    if [ -f "$KERNEL_ROOT/tools/mkbootimg/mkbootimg.py" ]; then
+        log "Using local mkbootimg from tools..."
+        export PYTHONPATH="$KERNEL_ROOT/tools/mkbootimg:$PYTHONPATH"
+        MKBOOTIMG_CMD="python3 $KERNEL_ROOT/tools/mkbootimg/mkbootimg.py"
+    elif ! command -v mkbootimg &> /dev/null; then
         warn "mkbootimg not found. Trying to use from Android build tools..."
         # Try to find mkbootimg in common Android locations
         if [ -f "$WORKSPACE_DIR/prebuilts/misc/linux-x86/libufdt/mkbootimg.py" ]; then

@@ -19,7 +19,18 @@ echo "Found Kernel: $KERNEL_IMAGE"
 # It contains NO ramdisk.
 echo "Creating $NEW_BOOT..."
 
-mkbootimg \
+# Setup mkbootimg command
+if [ -f "tools/mkbootimg/mkbootimg.py" ]; then
+    export PYTHONPATH="tools/mkbootimg:$PYTHONPATH"
+    MKBOOTIMG_CMD="python3 tools/mkbootimg/mkbootimg.py"
+elif command -v mkbootimg &> /dev/null; then
+    MKBOOTIMG_CMD="mkbootimg"
+else
+    echo "Error: mkbootimg not found."
+    exit 1
+fi
+
+$MKBOOTIMG_CMD \
     --kernel "$KERNEL_IMAGE" \
     --header_version 4 \
     --output "$NEW_BOOT"
