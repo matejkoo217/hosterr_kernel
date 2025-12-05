@@ -136,7 +136,8 @@ if [ "$SKIP_BUILD" = false ]; then
     log "Build timestamp: $BUILD_TIMESTAMP"
 
     cd "$WORKSPACE_DIR"
-    tools/bazel build $BAZEL_CCACHE_FLAGS $BAZEL_TIMESTAMP_FLAGS //common:kernel_aarch64_dist
+    # Allow passing extra Bazel flags via BAZEL_FLAGS environment variable
+    tools/bazel build ${BAZEL_FLAGS} $BAZEL_CCACHE_FLAGS $BAZEL_TIMESTAMP_FLAGS //common:kernel_aarch64_dist
 
     # Show ccache statistics after build
     show_ccache_stats

@@ -24,7 +24,8 @@ WORKSPACE_DIR="$REPO_ROOT/../gki_build_workspace"
 # Ensure WORKSPACE_DIR is absolute
 WORKSPACE_DIR="$(realpath -m "$WORKSPACE_DIR")"
 
-KERNEL_SRC="$WORKSPACE_DIR/common"
+# 修正 KERNEL_SRC 指向源码根目录，避免 KernelSU setup 失败
+KERNEL_SRC="$REPO_ROOT"
 CLANG_DIR="$WORKSPACE_DIR/prebuilts/clang/host/linux-x86"
 CLANG_VER="clang-r547379"
 STAMP_BZL="$WORKSPACE_DIR/build/kernel/kleaf/impl/stamp.bzl"

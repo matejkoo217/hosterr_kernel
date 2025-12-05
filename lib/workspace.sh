@@ -12,10 +12,74 @@ setup_workspace() {
     log "Setting up workspace..."
     mkdir -p "$WORKSPACE_DIR"
     cd "$WORKSPACE_DIR"
+
+    # 检测是否在 GitHub Actions 环境中（云构建）
+    if [ -n "${GITHUB_ACTIONS}" ]; then
+        # 云构建使用官方源地址
+        log "Detected GitHub Actions environment, using official sources..."
+        REPO_MANIFEST_URL="${REPO_MANIFEST_URL:-https://android.googlesource.com/kernel/manifest}"
+        REPO_TOOL_URL="${REPO_TOOL_URL:-https://gerrit.googlesource.com/git-repo}"
+        CLANG_FETCH_URL="${CLANG_FETCH_URL:-https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86.git}"
+    else
+        # 本地构建使用镜像源
+        log "Local build detected, using mirror sources..."
+        REPO_MANIFEST_URL="${REPO_MANIFEST_URL:-https://mirrors.ustc.edu.cn/aosp/kernel/manifest}"
+        REPO_TOOL_URL="${REPO_TOOL_URL:-https://mirrors.ustc.edu.cn/aosp/git-repo}"
+        CLANG_FETCH_URL="${CLANG_FETCH_URL:-https://mirrors.ustc.edu.cn/aosp/platform/prebuilts/clang/host/linux-x86.git}"
+    fi
     
-    if [ ! -d ".repo" ]; then
+    REPO_BRANCH="${REPO_BRANCH:-common-android13-5.15}"
+    REPO_TOOL_BRANCH="${REPO_TOOL_BRANCH:-stable}"
+
+    # Helper to run repo
+    run_repo() {
+        if [ -x ".repo/repo/repo" ]; then
+            .repo/repo/repo "$@"
+        else
+            repo "$@"
+        fi
+    }
+    
+    # 检查是否有缓存（.repo 目录且有 manifest）
+    if [ -d ".repo" ] && [ -f ".repo/manifests/default.xml" ]; then
+        if [ -n "${GITHUB_ACTIONS}" ]; then
+            # 云构建：进行完整性检查
+            log "Found cached repo, checking integrity..."
+            if [ -d "build/kernel" ] && [ -d "tools/bazel" ]; then
+                log "Cache appears valid, skipping repo init/sync"
+            else
+                log "Cache incomplete, re-initializing repo and running sync..."
+                # Clean up potential conflicting directories from manual fetch
+                if [ -d "prebuilts/clang/host/linux-x86/.git" ] && [ ! -f "prebuilts/clang/host/linux-x86/.git" ]; then
+                    log "Removing conflicting git repo in prebuilts/clang/host/linux-x86..."
+                    rm -rf "prebuilts/clang/host/linux-x86"
+                fi
+                run_repo init -c --repo-url "$REPO_TOOL_URL" --repo-branch "$REPO_TOOL_BRANCH" -u "$REPO_MANIFEST_URL" -b "$REPO_BRANCH"
+                log "Starting repo sync (this may take a while)..."
+                # 检查是否有正在运行的 repo sync 进程
+                if pgrep -f "repo.*sync" > /dev/null; then
+                    warn "Another repo sync process is running. Waiting for it to complete..."
+                    while pgrep -f "repo.*sync" > /dev/null; do
+                        sleep 2
+                        echo -n "."
+                    done
+                    echo ""
+                    log "Previous repo sync completed."
+                else
+                    # 使用详细模式显示进度，避免看起来卡住
+                    run_repo sync -c -j$(nproc) --no-tags --force-sync -v || {
+                        error "Repo sync failed. Please check the output above for details."
+                        exit 1
+                    }
+                fi
+            fi
+        else
+            # 本地构建：直接使用现有缓存，不检查完整性，不重新同步
+            log "Found cached repo, using existing cache (local build - skipping sync)"
+        fi
+    elif [ ! -d ".repo" ] || [ ! -f ".repo/manifests/default.xml" ]; then
         log "Initializing Repo..."
-        repo init -u https://android.googlesource.com/kernel/manifest -b common-android13-5.15
+        run_repo init -c --repo-url "$REPO_TOOL_URL" --repo-branch "$REPO_TOOL_BRANCH" -u "$REPO_MANIFEST_URL" -b "$REPO_BRANCH"
         mkdir -p .repo/local_manifests
         # Skip downloading kernel source (using local link)
         cat > .repo/local_manifests/local.xml <<EOF
@@ -25,7 +89,26 @@ setup_workspace() {
 </manifest>
 EOF
         log "Syncing repo (this may take a while)..."
-        repo sync -c -j$(nproc) --no-tags
+        # Clean up potential conflicting directories
+        if [ -d "prebuilts/clang/host/linux-x86/.git" ] && [ ! -f "prebuilts/clang/host/linux-x86/.git" ]; then
+             rm -rf "prebuilts/clang/host/linux-x86"
+        fi
+        # 检查是否有正在运行的 repo sync 进程
+        if pgrep -f "repo.*sync" > /dev/null; then
+            warn "Another repo sync process is running. Waiting for it to complete..."
+            while pgrep -f "repo.*sync" > /dev/null; do
+                sleep 2
+                echo -n "."
+            done
+            echo ""
+            log "Previous repo sync completed."
+        else
+            # 使用详细模式显示进度，避免看起来卡住
+            run_repo sync -c -j$(nproc) --no-tags -v || {
+                error "Repo sync failed. Please check the output above for details."
+                exit 1
+            }
+        fi
     fi
     
     # Source Linking
@@ -45,12 +128,26 @@ EOF
     fi
     
     # Fix: Ensure Clang Toolchain Exists (Manual Fetch if Repo Sync failed)
-    if [ ! -d "$CLANG_DIR/$CLANG_VER" ]; then
+    # CLANG_FETCH_URL 已在上面根据环境设置（本地镜像或官方源）
+    CLANG_FETCH_REF="${CLANG_FETCH_REF:-master}"
+    if [ -d "$CLANG_DIR/$CLANG_VER" ] && [ -f "$CLANG_DIR/$CLANG_VER/bin/clang" ]; then
+        log "Clang $CLANG_VER found (cached or from repo sync)"
+    else
         warn "Clang $CLANG_VER not found. Fetching manually..."
         mkdir -p "$CLANG_DIR" && cd "$CLANG_DIR"
-        git init
-        git remote add origin "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
-        git fetch --depth 1 origin master
+        # 清理可能存在的不完整目录
+        rm -rf "$CLANG_VER"
+        
+        # Use existing git repo if available, otherwise init
+        if [ ! -d ".git" ] && [ ! -f ".git" ]; then
+            git init
+        fi
+        
+        # Fetch directly from URL to avoid remote conflicts
+        log "Fetching $CLANG_VER from: $CLANG_FETCH_URL (ref: $CLANG_FETCH_REF)"
+        git remote remove origin 2>/dev/null || true
+        git remote add origin "$CLANG_FETCH_URL"
+        git fetch --depth 1 --no-tags origin "$CLANG_FETCH_REF"
         git checkout FETCH_HEAD -- "$CLANG_VER"
         cd "$WORKSPACE_DIR"
     fi

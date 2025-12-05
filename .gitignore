@@ -98,6 +98,7 @@ modules.order
 !.gitattributes
 !.github
 !.gitignore
+!.gitmodules
 !.mailmap
 
 #
