@@ -2187,8 +2187,6 @@
   synchronize_rcu_tasks_trace
   synchronize_srcu
   synchronize_srcu_expedited
-  synth_event_create
-  synth_event_delete
   syscon_node_to_regmap
   syscon_regmap_lookup_by_phandle
   sysctl_sched_features
