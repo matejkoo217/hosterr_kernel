@@ -61,8 +61,8 @@ unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
  *
  * (default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
-unsigned int sysctl_sched_min_granularity			= 750000ULL;
-static unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
+unsigned int sysctl_sched_min_granularity			= 2000000ULL;
+static unsigned int normalized_sysctl_sched_min_granularity	= 1000000ULL;
 
 /*
  * This value is kept at sysctl_sched_latency/sysctl_sched_min_granularity
@@ -84,7 +84,7 @@ unsigned int sysctl_sched_child_runs_first __read_mostly;
  *
  * (default: 1 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
-unsigned int sysctl_sched_wakeup_granularity			= 1000000UL;
+unsigned int sysctl_sched_wakeup_granularity			= 2000000UL;
 static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
 
 const_debug unsigned int sysctl_sched_migration_cost	= 75000UL;
@@ -263,6 +263,37 @@ static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight
 	}
 
 	return mul_u64_u32_shr(delta_exec, fact, shift);
+}
+/* SD8 Gen 2 CPU topology helpers
+ * LITTLE: 0–2
+ * BIG:    3–4
+ * PRIME:  5–7
+ */
+
+static inline bool sd8g2_is_little(int cpu)
+{
+	return cpu >= 0 && cpu <= 2;
+}
+
+static inline bool sd8g2_is_big(int cpu)
+{
+	return cpu >= 3 && cpu <= 4;
+}
+
+static inline bool sd8g2_is_prime(int cpu)
+{
+	return cpu >= 5 && cpu <= 7;
+}
+
+static inline int sd8g2_little_cpu(struct task_struct *p)
+{
+	int cpu;
+
+	for_each_cpu(cpu, p->cpus_ptr) {
+		if (sd8g2_is_little(cpu) && cpu_online(cpu))
+			return cpu;
+	}
+	return -1;
 }
 
 
@@ -4638,49 +4669,45 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 static void
 check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 {
-	unsigned long ideal_runtime, delta_exec;
-	struct sched_entity *se;
-	s64 delta;
-	bool skip_preempt = false;
+    unsigned long ideal_runtime, delta_exec;
+    struct sched_entity *se;
+    s64 delta;
+    bool skip_preempt = false;
+    u64 latency_cap = sysctl_sched_latency * 2;
+    latency_cap = (latency_cap * 3) >> 1; /* Multiply by 1.5 */
+    ideal_runtime = min_t(u64, sched_slice(cfs_rq, curr), latency_cap);
 
-	/*
-	 * When many tasks blow up the sched_period; it is possible that
-	 * sched_slice() reports unusually large results (when many tasks are
-	 * very light for example). Therefore impose a maximum.
-	 */
-	ideal_runtime = min_t(u64, sched_slice(cfs_rq, curr), sysctl_sched_latency);
+    delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
+    trace_android_rvh_check_preempt_tick(current, &ideal_runtime, &skip_preempt,
+            delta_exec, cfs_rq, curr, sysctl_sched_min_granularity);
+    if (skip_preempt)
+        return;
+    if (delta_exec > ideal_runtime) {
+        resched_curr(rq_of(cfs_rq));
+        /*
+         * The current task ran long enough, ensure it doesn't get
+         * re-elected due to buddy favours.
+         */
+        clear_buddies(cfs_rq, curr);
+        return;
+    }
 
-	delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
-	trace_android_rvh_check_preempt_tick(current, &ideal_runtime, &skip_preempt,
-			delta_exec, cfs_rq, curr, sysctl_sched_min_granularity);
-	if (skip_preempt)
-		return;
-	if (delta_exec > ideal_runtime) {
-		resched_curr(rq_of(cfs_rq));
-		/*
-		 * The current task ran long enough, ensure it doesn't get
-		 * re-elected due to buddy favours.
-		 */
-		clear_buddies(cfs_rq, curr);
-		return;
-	}
+    /*
+     * Ensure that a task that missed wakeup preemption by a
+     * narrow margin doesn't have to wait for a full slice.
+     * This also mitigates buddy induced latencies under load.
+     */
+    if (delta_exec < sysctl_sched_min_granularity)
+        return;
 
-	/*
-	 * Ensure that a task that missed wakeup preemption by a
-	 * narrow margin doesn't have to wait for a full slice.
-	 * This also mitigates buddy induced latencies under load.
-	 */
-	if (delta_exec < sysctl_sched_min_granularity)
-		return;
+    se = __pick_first_entity(cfs_rq);
+    delta = curr->vruntime - se->vruntime;
 
-	se = __pick_first_entity(cfs_rq);
-	delta = curr->vruntime - se->vruntime;
+    if (delta < 0)
+        return;
 
-	if (delta < 0)
-		return;
-
-	if (delta > ideal_runtime)
-		resched_curr(rq_of(cfs_rq));
+    if (delta > ideal_runtime)
+        resched_curr(rq_of(cfs_rq));
 }
 
 void set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -7241,71 +7268,88 @@ unlock:
 static int
 select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 {
-	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
-	struct sched_domain *tmp, *sd = NULL;
-	int cpu = smp_processor_id();
-	int new_cpu = prev_cpu;
-	int want_affine = 0;
-	int target_cpu = -1;
-	/* SD_flags and WF_flags share the first nibble */
-	int sd_flag = wake_flags & 0xF;
+    int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
+    struct sched_domain *tmp, *sd = NULL;
+    int cpu = smp_processor_id();
+    int new_cpu = prev_cpu;
+    int want_affine = 0;
+    int target_cpu = -1;
+    int sd_flag = wake_flags & 0xF;
 
-	if (trace_android_rvh_select_task_rq_fair_enabled() &&
-	    !(sd_flag & SD_BALANCE_FORK))
-		sync_entity_load_avg(&p->se);
-	trace_android_rvh_select_task_rq_fair(p, prev_cpu, sd_flag,
-			wake_flags, &target_cpu);
-	if (target_cpu >= 0)
-		return target_cpu;
+    if ((wake_flags & WF_TTWU) && p->prio > 120) {
+    	int little = sd8g2_little_cpu(p);
+    	if (little >= 0)
+    		return little;
+    }
 
-	/*
-	 * required for stable ->cpus_allowed
-	 */
-	lockdep_assert_held(&p->pi_lock);
-	if (wake_flags & WF_TTWU) {
-		record_wakee(p);
+    if (trace_android_rvh_select_task_rq_fair_enabled() &&
+        !(sd_flag & SD_BALANCE_FORK))
+        sync_entity_load_avg(&p->se);
 
-		if (sched_energy_enabled()) {
-			new_cpu = find_energy_efficient_cpu(p, prev_cpu, sync);
-			if (new_cpu >= 0)
-				return new_cpu;
-			new_cpu = prev_cpu;
-		}
+    trace_android_rvh_select_task_rq_fair(p, prev_cpu, sd_flag,
+            wake_flags, &target_cpu);
 
-		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
-	}
+    if (target_cpu >= 0)
+        return target_cpu;
 
-	rcu_read_lock();
-	for_each_domain(cpu, tmp) {
-		/*
+    lockdep_assert_held(&p->pi_lock);
+
+    if (wake_flags & WF_TTWU) {
+        record_wakee(p);
+
+        if (p->prio < 110 &&
+            sd8g2_is_prime(prev_cpu) &&
+            uclamp_eff_value(p, UCLAMP_MIN) > 0)
+            return prev_cpu;
+
+        /* Standard Energy Aware Scheduling (EAS) */
+        if (sched_energy_enabled()) {
+            new_cpu = find_energy_efficient_cpu(p, prev_cpu, sync);
+            if (new_cpu >= 0)
+                return new_cpu;
+            new_cpu = prev_cpu;
+        }
+
+        want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
+    }
+
+    rcu_read_lock();
+    for_each_domain(cpu, tmp) {
+    	/*
 		 * If both 'cpu' and 'prev_cpu' are part of this domain,
 		 * cpu is a valid SD_WAKE_AFFINE target.
 		 */
-		if (want_affine && (tmp->flags & SD_WAKE_AFFINE) &&
-		    cpumask_test_cpu(prev_cpu, sched_domain_span(tmp))) {
-			if (cpu != prev_cpu)
-				new_cpu = wake_affine(tmp, p, cpu, prev_cpu, sync);
+        if (want_affine && (tmp->flags & SD_WAKE_AFFINE) &&
+            cpumask_test_cpu(prev_cpu, sched_domain_span(tmp))) {
 
-			sd = NULL; /* Prefer wake_affine over balance flags */
-			break;
-		}
+            if (sync && cpu == prev_cpu &&
+                idle_cpu(cpu)) {
+            	new_cpu = cpu;
+            } else if (cpu != prev_cpu) {
+                new_cpu = wake_affine(tmp, p, cpu, prev_cpu, sync);
+            }
 
-		if (tmp->flags & sd_flag)
-			sd = tmp;
-		else if (!want_affine)
-			break;
-	}
+            sd = NULL;
+            break;
+        }
 
-	if (unlikely(sd)) {
-		/* Slow path */
-		new_cpu = find_idlest_cpu(sd, p, cpu, prev_cpu, sd_flag);
-	} else if (wake_flags & WF_TTWU) { /* XXX always ? */
-		/* Fast path */
-		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
-	}
-	rcu_read_unlock();
+        if (tmp->flags & sd_flag)
+            sd = tmp;
+        else if (!want_affine)
+            break;
+    }
 
-	return new_cpu;
+    if (unlikely(sd)) {
+        new_cpu = find_idlest_cpu(sd, p, cpu, prev_cpu, sd_flag);
+    } else if (wake_flags & WF_TTWU) {
+        if (wake_flags & WF_TTWU &&
+            (sd8g2_is_prime(prev_cpu) || sd8g2_is_big(prev_cpu))) {
+        	new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
+        }
+    }
+    rcu_read_unlock();
+
+    return new_cpu;
 }
 
 static void detach_entity_cfs_rq(struct sched_entity *se);

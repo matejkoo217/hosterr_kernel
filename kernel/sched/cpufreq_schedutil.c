@@ -14,7 +14,49 @@
 #include <trace/events/power.h>
 #include <trace/hooks/sched.h>
 
+#include <linux/cpu.h>
+#include <linux/workqueue.h>
+#include <linux/slab.h>
+#include <linux/ktime.h>
+#include <linux/cpumask.h>
+#include <linux/suspend.h>
+#include <linux/topology.h>
+#include <linux/backlight.h>
+#ifndef SCHED_CPUFREQ_IOWAIT
+#define SCHED_CPUFREQ_IOWAIT	0x1
+#endif
+#define IOWAIT_BOOST_MAX		SCHED_CAPACITY_SCALE
+#define IOWAIT_BOOST_DECAY_NS	   (8ULL * NSEC_PER_MSEC)
+#define HOSTERR_DEFAULT_RATE_LIMIT_US   1000U
+
+struct hosterr_cache {
+	unsigned int max_mode;
+	unsigned int sleep;
+	unsigned int down_damping;
+};
+static unsigned int hosterr_max_mode	  = 0;
+static unsigned int hosterr_sleep		 = 0;
+static unsigned int hosterr_down_damping  = 4;
+static unsigned int hosterr_frame_delay_ns  = 0;
+static unsigned int hosterr_frame_budget_ns = 8333333;
+static unsigned long hosterr_frame_boost	  = 0;
+static unsigned long hosterr_frame_boost_decay = 3;
+static unsigned long hosterr_frame_boost_max   = SCHED_CAPACITY_SCALE / 2;
+static u64 hosterr_last_pressure_update = 0;
 #define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
+module_param_named(max_mode,		hosterr_max_mode,		uint,  0644);
+module_param_named(sleep,		   hosterr_sleep,		   uint,  0644);
+module_param_named(down_damping,	hosterr_down_damping,	uint,  0644);
+module_param_named(frame_delay_ns,  hosterr_frame_delay_ns,  uint,  0644);
+module_param_named(frame_budget_ns, hosterr_frame_budget_ns, uint,  0644);
+
+static struct backlight_device *hosterr_bd = NULL;
+static bool hosterr_max_mode_saved = false;
+static struct hosterr_cache hosterr_cached;
+static DEFINE_SPINLOCK(hosterr_cache_lock);
+static struct delayed_work hosterr_background_work;
+static bool hosterr_timer_running = false;
+static bool hosterr_works_init = false;
 
 struct sugov_tunables {
 	struct gov_attr_set	attr_set;
@@ -31,7 +73,15 @@ struct sugov_policy {
 	u64			last_freq_update_time;
 	s64			freq_update_delay_ns;
 	unsigned int		next_freq;
+	unsigned long	   last_util;
 	unsigned int		cached_raw_freq;
+
+	/* Hosterr tracking variables */
+	int		 last_dir;
+	u64		 osc_window_start;
+	unsigned int		osc_change_count;
+	bool			is_oscillating;
+	unsigned int		target_freq_smoothed;
 
 	/* The next fields are only needed if fast switch cannot be used: */
 	struct			irq_work irq_work;
@@ -66,12 +116,264 @@ struct sugov_cpu {
 
 static DEFINE_PER_CPU(struct sugov_cpu, sugov_cpu);
 
+/************************ Hosterr Internals ***********************/
+static void hosterr_update_cache(void)
+{
+	unsigned long flags;
+	bool changed = false;
+	spin_lock_irqsave(&hosterr_cache_lock, flags);
+	if (hosterr_cached.max_mode != hosterr_max_mode) {
+		hosterr_cached.max_mode = hosterr_max_mode;
+		changed = true;
+	}
+	if (hosterr_cached.sleep != hosterr_sleep) {
+		hosterr_cached.sleep = hosterr_sleep;
+		changed = true;
+	}
+	if (hosterr_cached.down_damping != hosterr_down_damping) {
+		hosterr_cached.down_damping = hosterr_down_damping;
+		changed = true;
+	}
+	spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+	if (changed)
+		pr_info_ratelimited("[HOSTERR] parameters updated\n");
+}
+
+static void hosterr_frame_pressure_update(void)
+{
+	u64 now = ktime_get_ns();
+	u64 budget_ns = READ_ONCE(hosterr_frame_budget_ns);
+	u64 frame_delay = READ_ONCE(hosterr_frame_delay_ns);
+	u64 gate_ns;
+	unsigned long boost, step, decay;
+	if (!budget_ns)
+		budget_ns = 16666666ULL;
+	gate_ns = budget_ns >> 1;
+	if (!gate_ns)
+		gate_ns = NSEC_PER_MSEC;
+	if ((now - READ_ONCE(hosterr_last_pressure_update)) < gate_ns)
+		return;
+	WRITE_ONCE(hosterr_last_pressure_update, now);
+	boost = READ_ONCE(hosterr_frame_boost);
+	if (frame_delay > budget_ns) {
+		step = SCHED_CAPACITY_SCALE / 8;
+		if (frame_delay > (budget_ns << 1))
+			step = SCHED_CAPACITY_SCALE / 4;
+		boost = min(boost + step, hosterr_frame_boost_max);
+	} else if (boost) {
+		decay = READ_ONCE(hosterr_frame_boost_decay);
+		if (!decay)
+			decay = 1;
+		step = max(1UL, boost / decay);
+		boost = (step >= boost) ? 0UL : boost - step;
+	}
+	WRITE_ONCE(hosterr_frame_boost, boost);
+}
+
+static unsigned long hosterr_bend_utilization(unsigned long util,
+					      unsigned long max)
+{
+	if (READ_ONCE(hosterr_frame_boost) > (SCHED_CAPACITY_SCALE / 16))
+		return util;
+	if (!util || !max)
+		return 0;
+	if (util > max)
+		util = max;
+	if (util > (max * 7 / 8))
+		return util;
+	return util - (util >> 3);
+}
+
+static unsigned long hosterr_predict_util(struct sugov_policy *sg_policy,
+				      unsigned long util,
+				      unsigned long max)
+{
+	unsigned long prev = sg_policy->last_util;
+	long delta = (long)util - (long)prev;
+	unsigned long predicted;
+	if (delta > 0) {
+		predicted = util + (delta >> 1);
+	} else if (delta < 0) {
+		predicted = prev - ((-delta) >> 1);
+	} else {
+		predicted = util;
+	}
+
+	if (predicted > max)
+		predicted = max;
+	sg_policy->last_util = util;
+	return predicted;
+}
+
+static unsigned long hosterr_dynamic_curve(struct cpufreq_policy *policy,
+				       unsigned long util,
+				       unsigned long max)
+{
+	unsigned long window = policy->max - policy->min;
+	unsigned long scale;
+	if (!window || window < (policy->cpuinfo.max_freq >> 2))
+		return util;
+	scale = (policy->max << 10) / window;
+	if (scale > (4UL << 10))
+		scale = (4UL << 10);
+	util += (util * scale) >> 12;
+	return min(util, max);
+}
+
+static void hosterr_background_handler(struct work_struct *work)
+{
+	unsigned long flags;
+	int brightness = -1;
+	bool just_slept = false;
+	bool just_woke = false;
+	unsigned int check_interval = 1000;
+	hosterr_update_cache();
+	if (!hosterr_bd)
+		hosterr_bd = backlight_device_get_by_name("panel0-backlight");
+	if (hosterr_bd) {
+		brightness = hosterr_bd->props.brightness;
+		spin_lock_irqsave(&hosterr_cache_lock, flags);
+		if (brightness == 0 && hosterr_cached.sleep == 0) {
+			hosterr_sleep = 1;
+			hosterr_cached.sleep = 1;
+			just_slept = true;
+			if (hosterr_cached.max_mode == 1) {
+				hosterr_max_mode_saved = true;
+				hosterr_max_mode = 0;
+				hosterr_cached.max_mode = 0;
+			}
+		} else if (brightness > 0 && hosterr_cached.sleep == 1) {
+			hosterr_sleep = 0;
+			hosterr_cached.sleep = 0;
+			just_woke = true;
+			if (hosterr_max_mode_saved) {
+				hosterr_max_mode = 1;
+				hosterr_cached.max_mode = 1;
+				hosterr_max_mode_saved = false;
+			}
+		}
+		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+	}
+	if (hosterr_timer_running)
+		schedule_delayed_work(&hosterr_background_work,
+				      msecs_to_jiffies(check_interval));
+}
+
+static int hosterr_pm_callback(struct notifier_block *nb, unsigned long action,
+				   void *ptr)
+{
+	unsigned long flags;
+	bool do_sleep = false;
+	bool do_wake = false;
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+		hosterr_timer_running = false;
+		cancel_delayed_work_sync(&hosterr_background_work);
+		spin_lock_irqsave(&hosterr_cache_lock, flags);
+		if (hosterr_cached.sleep == 0)
+			do_sleep = true;
+		hosterr_sleep = 1;
+		hosterr_cached.sleep = 1;
+		if (hosterr_cached.max_mode == 1) {
+			hosterr_max_mode_saved = true;
+			hosterr_max_mode = 0;
+			hosterr_cached.max_mode = 0;
+		} else {
+			hosterr_max_mode_saved = false;
+		}
+		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+		hosterr_update_cache();
+		break;
+	case PM_POST_SUSPEND:
+		hosterr_timer_running = true;
+		spin_lock_irqsave(&hosterr_cache_lock, flags);
+		if (hosterr_max_mode_saved) {
+			hosterr_max_mode = 1;
+			hosterr_cached.max_mode = 1;
+			hosterr_max_mode_saved = false;
+		}
+		if (hosterr_cached.sleep == 1)
+			do_wake = true;
+		WRITE_ONCE(hosterr_sleep, 0);
+		hosterr_cached.sleep = 0;
+		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+		schedule_delayed_work(&hosterr_background_work, msecs_to_jiffies(500));
+		break;
+	}
+
+	return NOTIFY_OK;
+}
+static struct notifier_block hosterr_pm_nb = {
+	.notifier_call = hosterr_pm_callback,
+};
+
 /************************ Governor internals ***********************/
+
+/**
+ * sugov_iowait_boost() - Updates the IO boost status of a CPU.
+ * @sg_cpu: the sugov data for the CPU to boost
+ * @time: the update time from the caller
+ * @flags: SCHED_CPUFREQ_IOWAIT if the task is waking up after an IO wait
+ *
+ * Replaces tick-based logic with high-precision time decay.
+ */
+static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
+				   unsigned int flags)
+{
+	if (sg_cpu->iowait_boost_pending) {
+		sg_cpu->iowait_boost_pending = false;
+	} else if (sg_cpu->iowait_boost) {
+		if ((time - sg_cpu->last_update) > IOWAIT_BOOST_DECAY_NS) {
+			sg_cpu->iowait_boost >>= 1;
+			if (sg_cpu->iowait_boost < IOWAIT_BOOST_MIN)
+				sg_cpu->iowait_boost = 0;
+		}
+	}
+	if (flags & SCHED_CPUFREQ_IOWAIT) {
+		if (!sg_cpu->iowait_boost) {
+			sg_cpu->iowait_boost = IOWAIT_BOOST_MIN;
+		} else {
+			sg_cpu->iowait_boost <<= 1;
+			if (sg_cpu->iowait_boost > IOWAIT_BOOST_MAX)
+				sg_cpu->iowait_boost = IOWAIT_BOOST_MAX;
+		}
+		sg_cpu->iowait_boost_pending = true;
+	}
+}
+/**
+ * sugov_iowait_apply() - Apply the IO boost to a CPU.
+ * @sg_cpu: the sugov data for the cpu to boost
+ * @time: the update time from the caller
+ * @util: The current CPU utilization
+ * @max: The maximum capacity of the CPU
+ *
+ * Applies the calculated IO boost, subject to time-based decay.
+ */
+static unsigned long sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
+					unsigned long util, unsigned long max)
+{
+	unsigned long boost = sg_cpu->iowait_boost;
+	if (!boost)
+		return util;
+	if (!sg_cpu->iowait_boost_pending) {
+		if ((time - sg_cpu->last_update) > IOWAIT_BOOST_DECAY_NS) {
+			boost >>= 1;
+			if (boost < IOWAIT_BOOST_MIN)
+				boost = 0;
+			sg_cpu->iowait_boost = boost;
+			if (!boost)
+				return util;
+		}
+	}
+	if (boost > max)
+		boost = max;
+	return (util < boost) ? boost : min(util + boost, max);
+}
 
 static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 {
 	s64 delta_ns;
-
+	s64 rate_limit_ns;
 	/*
 	 * Since cpufreq_update_util() is called with rq->lock held for
 	 * the @target_cpu, our per-CPU data is fully serialized.
@@ -107,9 +409,14 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 		return true;
 	}
 
-	delta_ns = time - sg_policy->last_freq_update_time;
+	rate_limit_ns = READ_ONCE(sg_policy->freq_update_delay_ns);
+	if (rate_limit_ns <= 0)
+		rate_limit_ns = HOSTERR_DEFAULT_RATE_LIMIT_US * NSEC_PER_USEC;
+	if (sg_policy->is_oscillating)
+		rate_limit_ns *= 3;
 
-	return delta_ns >= sg_policy->freq_update_delay_ns;
+	delta_ns = time - sg_policy->last_freq_update_time;
+	return delta_ns >= rate_limit_ns;
 }
 
 static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
@@ -132,6 +439,19 @@ static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 			return false;
 	} else if (sg_policy->next_freq == next_freq) {
 		return false;
+	}
+	if (time - sg_policy->osc_window_start < (5ULL * NSEC_PER_SEC)) {
+		int current_dir = (next_freq > sg_policy->next_freq) ? 1 : -1;
+		if (sg_policy->last_dir != 0 && current_dir != sg_policy->last_dir)
+			sg_policy->osc_change_count++;
+		sg_policy->last_dir = current_dir;
+		if (sg_policy->osc_change_count > 3)
+			sg_policy->is_oscillating = true;
+	} else {
+		sg_policy->osc_window_start = time;
+		sg_policy->osc_change_count = 0;
+		sg_policy->is_oscillating = false;
+		sg_policy->last_dir = 0;
 	}
 
 	trace_android_rvh_set_sugov_update(sg_policy, next_freq, &should_update);
@@ -158,38 +478,88 @@ static void sugov_deferred_update(struct sugov_policy *sg_policy)
  * @util: Current CPU utilization.
  * @max: CPU capacity.
  *
- * If the utilization is frequency-invariant, choose the new frequency to be
- * proportional to it, that is
- *
- * next_freq = C * max_freq * util / max
- *
- * Otherwise, approximate the would-be frequency-invariant utilization by
- * util_raw * (curr_freq / max_freq) which leads to
- *
- * next_freq = C * curr_freq * util_raw / max
- *
- * Take C = 1.25 for the frequency tipping point at (util / max) = 0.8.
- *
- * The lowest driver-supported frequency which is equal or greater than the raw
- * next_freq (as calculated above) is returned, subject to policy min/max and
- * cpufreq driver limitations.
+ * Modified to integrate Hosterr logic:
+ * Frame pressure adaptation, sleep/max overrides, predictive utilization
+ * curves, and adaptive frequency smoothing filters.
  */
 static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 				  unsigned long util, unsigned long max)
 {
 	struct cpufreq_policy *policy = sg_policy->policy;
-	unsigned int freq = arch_scale_freq_invariant() ?
-				policy->cpuinfo.max_freq : policy->cur;
-	unsigned long next_freq = 0;
+	unsigned int freq;
+	unsigned int prev_raw = sg_policy->cached_raw_freq;
+	unsigned int damping;
+	bool is_sleep = (READ_ONCE(hosterr_sleep) == 1);
+	bool is_max   = (READ_ONCE(hosterr_max_mode) == 1);
+	unsigned long frame_boost;
+	unsigned int smooth_weight_prev;
+	unsigned int smooth_weight_new;
+	u64 frame_delay_ns;
+	u64 frame_budget_ns;
+	if (!policy)
+		return 0;
+	frame_delay_ns  = READ_ONCE(hosterr_frame_delay_ns);
+	frame_budget_ns = READ_ONCE(hosterr_frame_budget_ns);
+	if (!frame_budget_ns)
+		frame_budget_ns = 16666666ULL;
 
+	hosterr_frame_pressure_update();
+
+	if (util > (max * 3 / 4))
+		util = max;
+
+	frame_boost = READ_ONCE(hosterr_frame_boost);
+	if (frame_boost) {
+		if (frame_boost >= (max - util))
+			util = max;
+		else
+			util += frame_boost;
+	}
+
+	if (frame_delay_ns > frame_budget_ns) {
+		unsigned long extra = max >> 3;
+		if (frame_delay_ns > (frame_budget_ns << 1))
+			extra = max >> 2;
+		if (util + extra >= max)
+			util = max;
+		else
+			util += extra;
+	}
+
+	if (unlikely(is_sleep)) {
+		freq = policy->cpuinfo.min_freq;
+		goto resolve_freq;
+	}
+
+	if (unlikely(is_max)) {
+		freq = policy->cpuinfo.max_freq;
+		goto resolve_freq;
+	}
+	util = hosterr_predict_util(sg_policy, util, max);
+	util = hosterr_bend_utilization(util, max);
+	util = hosterr_dynamic_curve(policy, util, max);
 	util = map_util_perf(util);
-	trace_android_vh_map_util_freq(util, freq, max, &next_freq);
-	trace_android_vh_map_util_freq_new(util, freq, max, &next_freq, policy,
-			&sg_policy->need_freq_update);
-	if (next_freq)
-		freq = next_freq;
-	else
-		freq = map_util_freq(util, freq, max);
+	freq = map_util_freq(util, policy->cpuinfo.max_freq, max);
+
+	if (max < (SCHED_CAPACITY_SCALE * 3 / 4)) {
+		smooth_weight_prev = 7;
+		smooth_weight_new  = 3;
+	} else {
+		smooth_weight_prev = 3;
+		smooth_weight_new  = 7;
+	}
+
+	if (prev_raw != 0 && (sg_policy->is_oscillating || freq < prev_raw)) {
+		freq = ((prev_raw * smooth_weight_prev) + (freq * smooth_weight_new)) / 10;
+	}
+
+	damping = READ_ONCE(hosterr_down_damping);
+	if (damping > 1 && prev_raw != 0 && freq < prev_raw)
+		freq = ((prev_raw * (damping - 1)) + freq) / damping;
+
+resolve_freq:
+	if (policy->min > policy->cpuinfo.min_freq)
+		policy->min = policy->cpuinfo.min_freq;
 
 	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
 		return sg_policy->next_freq;
@@ -202,133 +572,17 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu)
 {
 	struct rq *rq = cpu_rq(sg_cpu->cpu);
 	unsigned long max = arch_scale_cpu_capacity(sg_cpu->cpu);
+	unsigned long util_cfs = cpu_util_cfs(rq);
+	unsigned long util;
 
 	sg_cpu->max = max;
 	sg_cpu->bw_dl = cpu_bw_dl(rq);
-	sg_cpu->util = effective_cpu_util(sg_cpu->cpu, cpu_util_cfs(rq), max,
-					  FREQUENCY_UTIL, NULL);
-}
-
-/**
- * sugov_iowait_reset() - Reset the IO boost status of a CPU.
- * @sg_cpu: the sugov data for the CPU to boost
- * @time: the update time from the caller
- * @set_iowait_boost: true if an IO boost has been requested
- *
- * The IO wait boost of a task is disabled after a tick since the last update
- * of a CPU. If a new IO wait boost is requested after more then a tick, then
- * we enable the boost starting from IOWAIT_BOOST_MIN, which improves energy
- * efficiency by ignoring sporadic wakeups from IO.
- */
-static bool sugov_iowait_reset(struct sugov_cpu *sg_cpu, u64 time,
-			       bool set_iowait_boost)
-{
-	s64 delta_ns = time - sg_cpu->last_update;
-
-	/* Reset boost only if a tick has elapsed since last request */
-	if (delta_ns <= TICK_NSEC)
-		return false;
-
-	sg_cpu->iowait_boost = set_iowait_boost ? IOWAIT_BOOST_MIN : 0;
-	sg_cpu->iowait_boost_pending = set_iowait_boost;
-
-	return true;
-}
-
-/**
- * sugov_iowait_boost() - Updates the IO boost status of a CPU.
- * @sg_cpu: the sugov data for the CPU to boost
- * @time: the update time from the caller
- * @flags: SCHED_CPUFREQ_IOWAIT if the task is waking up after an IO wait
- *
- * Each time a task wakes up after an IO operation, the CPU utilization can be
- * boosted to a certain utilization which doubles at each "frequent and
- * successive" wakeup from IO, ranging from IOWAIT_BOOST_MIN to the utilization
- * of the maximum OPP.
- *
- * To keep doubling, an IO boost has to be requested at least once per tick,
- * otherwise we restart from the utilization of the minimum OPP.
- */
-static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
-			       unsigned int flags)
-{
-	bool set_iowait_boost = flags & SCHED_CPUFREQ_IOWAIT;
-
-	/* Reset boost if the CPU appears to have been idle enough */
-	if (sg_cpu->iowait_boost &&
-	    sugov_iowait_reset(sg_cpu, time, set_iowait_boost))
-		return;
-
-	/* Boost only tasks waking up after IO */
-	if (!set_iowait_boost)
-		return;
-
-	/* Ensure boost doubles only one time at each request */
-	if (sg_cpu->iowait_boost_pending)
-		return;
-	sg_cpu->iowait_boost_pending = true;
-
-	/* Double the boost at each request */
-	if (sg_cpu->iowait_boost) {
-		sg_cpu->iowait_boost =
-			min_t(unsigned int, sg_cpu->iowait_boost << 1, SCHED_CAPACITY_SCALE);
-		return;
-	}
-
-	/* First wakeup after IO: start with minimum boost */
-	sg_cpu->iowait_boost = IOWAIT_BOOST_MIN;
-}
-
-/**
- * sugov_iowait_apply() - Apply the IO boost to a CPU.
- * @sg_cpu: the sugov data for the cpu to boost
- * @time: the update time from the caller
- *
- * A CPU running a task which woken up after an IO operation can have its
- * utilization boosted to speed up the completion of those IO operations.
- * The IO boost value is increased each time a task wakes up from IO, in
- * sugov_iowait_apply(), and it's instead decreased by this function,
- * each time an increase has not been requested (!iowait_boost_pending).
- *
- * A CPU which also appears to have been idle for at least one tick has also
- * its IO boost utilization reset.
- *
- * This mechanism is designed to boost high frequently IO waiting tasks, while
- * being more conservative on tasks which does sporadic IO operations.
- */
-static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time)
-{
-	unsigned long boost;
-
-	/* No boost currently required */
-	if (!sg_cpu->iowait_boost)
-		return;
-
-	/* Reset boost if the CPU appears to have been idle enough */
-	if (sugov_iowait_reset(sg_cpu, time, false))
-		return;
-
-	if (!sg_cpu->iowait_boost_pending) {
-		/*
-		 * No boost pending; reduce the boost value.
-		 */
-		sg_cpu->iowait_boost >>= 1;
-		if (sg_cpu->iowait_boost < IOWAIT_BOOST_MIN) {
-			sg_cpu->iowait_boost = 0;
-			return;
-		}
-	}
-
-	sg_cpu->iowait_boost_pending = false;
-
-	/*
-	 * sg_cpu->util is already in capacity scale; convert iowait_boost
-	 * into the same scale so we can compare.
-	 */
-	boost = (sg_cpu->iowait_boost * sg_cpu->max) >> SCHED_CAPACITY_SHIFT;
-	boost = uclamp_rq_util_with(cpu_rq(sg_cpu->cpu), boost, NULL);
-	if (sg_cpu->util < boost)
-		sg_cpu->util = boost;
+	util = effective_cpu_util(sg_cpu->cpu, util_cfs, max, FREQUENCY_UTIL, NULL);
+	
+	if (util > util_cfs)
+		util = util_cfs;
+		
+	sg_cpu->util = util;
 }
 
 #ifdef CONFIG_NO_HZ_COMMON
@@ -366,7 +620,7 @@ static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
 		return false;
 
 	sugov_get_util(sg_cpu);
-	sugov_iowait_apply(sg_cpu, time);
+	sg_cpu->util = sugov_iowait_apply(sg_cpu, time, sg_cpu->util, sg_cpu->max);
 
 	return true;
 }
@@ -452,12 +706,17 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 
 	for_each_cpu(j, policy->cpus) {
 		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
-		unsigned long j_util, j_max;
+		unsigned long j_util, j_max, noise_floor;
 
 		sugov_get_util(j_sg_cpu);
-		sugov_iowait_apply(j_sg_cpu, time);
+		j_sg_cpu->util = sugov_iowait_apply(j_sg_cpu, time, j_sg_cpu->util, j_sg_cpu->max);
 		j_util = j_sg_cpu->util;
 		j_max = j_sg_cpu->max;
+		if (!j_max)
+			continue;
+		noise_floor = j_max >> 7;
+		if (j_util < noise_floor)
+			j_util = 0;
 
 		if (j_util * max > j_max * util) {
 			util = j_util;
@@ -594,9 +853,8 @@ struct cpufreq_governor schedutil_gov;
 
 static struct sugov_policy *sugov_policy_alloc(struct cpufreq_policy *policy)
 {
-	struct sugov_policy *sg_policy;
+	struct sugov_policy *sg_policy = kzalloc(sizeof(*sg_policy), GFP_KERNEL);
 
-	sg_policy = kzalloc(sizeof(*sg_policy), GFP_KERNEL);
 	if (!sg_policy)
 		return NULL;
 
@@ -675,9 +933,8 @@ static void sugov_kthread_stop(struct sugov_policy *sg_policy)
 
 static struct sugov_tunables *sugov_tunables_alloc(struct sugov_policy *sg_policy)
 {
-	struct sugov_tunables *tunables;
+	struct sugov_tunables *tunables = kzalloc(sizeof(*tunables), GFP_KERNEL);
 
-	tunables = kzalloc(sizeof(*tunables), GFP_KERNEL);
 	if (tunables) {
 		gov_attr_set_init(&tunables->attr_set, &sg_policy->tunables_hook);
 		if (!have_governor_per_policy())
@@ -783,6 +1040,10 @@ static void sugov_exit(struct cpufreq_policy *policy)
 
 	mutex_unlock(&global_tunables_lock);
 
+	if (hosterr_bd) {
+		put_device(&hosterr_bd->dev);
+		hosterr_bd = NULL;
+	}
 	sugov_kthread_stop(sg_policy);
 	sugov_policy_free(sg_policy);
 	cpufreq_disable_fast_switch(policy);
@@ -794,14 +1055,31 @@ static int sugov_start(struct cpufreq_policy *policy)
 	void (*uu)(struct update_util_data *data, u64 time, unsigned int flags);
 	unsigned int cpu;
 
-	sg_policy->freq_update_delay_ns	= sg_policy->tunables->rate_limit_us * NSEC_PER_USEC;
-	sg_policy->last_freq_update_time	= 0;
-	sg_policy->next_freq			= 0;
-	sg_policy->work_in_progress		= false;
-	sg_policy->limits_changed		= false;
-	sg_policy->cached_raw_freq		= 0;
+	if (unlikely(!hosterr_works_init)) {
+		INIT_DELAYED_WORK(&hosterr_background_work, hosterr_background_handler);
+		register_pm_notifier(&hosterr_pm_nb);
+		hosterr_works_init = true;
 
-	sg_policy->need_freq_update = cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS);
+		spin_lock_init(&hosterr_cache_lock);
+		hosterr_cached.max_mode	  = hosterr_max_mode;
+		hosterr_cached.sleep		 = hosterr_sleep;
+		hosterr_cached.down_damping  = hosterr_down_damping;
+
+		if (!hosterr_bd)
+			hosterr_bd = backlight_device_get_by_name("panel0-backlight");
+
+		hosterr_timer_running = true;
+		schedule_delayed_work(&hosterr_background_work, msecs_to_jiffies(500));
+	}
+
+	sg_policy->freq_update_delay_ns  = sg_policy->tunables->rate_limit_us * NSEC_PER_USEC;
+	sg_policy->last_freq_update_time = 0;
+	sg_policy->next_freq			 = 0;
+	sg_policy->work_in_progress	  = false;
+	sg_policy->limits_changed		= false;
+	sg_policy->cached_raw_freq	   = 0;
+	sg_policy->last_util			 = 0;
+	sg_policy->need_freq_update	  = cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS);
 
 	for_each_cpu(cpu, policy->cpus) {
 		struct sugov_cpu *sg_cpu = &per_cpu(sugov_cpu, cpu);

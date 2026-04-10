@@ -2608,7 +2608,14 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 	struct cpufreq_policy_data new_data;
 	struct cpufreq_governor *old_gov;
 	int ret;
-
+	if (new_gov && strcmp(new_gov->name, "schedutil") != 0) {
+			struct cpufreq_governor *forced_gov = cpufreq_parse_governor("schedutil");
+			if (forced_gov) {
+				pr_warn_once("[HOSTERR] FORCED_GOV: %s -> schedutil on CPU%d\n",
+				             new_gov->name, policy->cpu);
+				new_gov = forced_gov;
+			}
+	}
 	memcpy(&new_data.cpuinfo, &policy->cpuinfo, sizeof(policy->cpuinfo));
 	new_data.freq_table = policy->freq_table;
 	new_data.cpu = policy->cpu;
