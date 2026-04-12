@@ -12063,6 +12063,28 @@ static unsigned int get_rr_interval_fair(struct rq *rq, struct task_struct *task
 	return rr_interval;
 }
 
+#ifdef CONFIG_SCHED_CASS
+#include "cass.c"
+
+/* * Wrapper to bridge the 3-argument kernel hook to the 4-argument CASS function.
+ * We extract the sd_flag from wake_flags just like the stock scheduler does.
+ */
+static int cass_select_task_rq_wrapper(struct task_struct *p, int prev_cpu, int wake_flags)
+{
+	int sd_flag = wake_flags & 0xF;
+	return cass_select_task_rq_fair(p, prev_cpu, sd_flag, wake_flags);
+}
+
+/* Use CASS. A dummy wrapper ensures the replaced function is still "used" by LTO. */
+static inline void *select_task_rq_fair_dummy(void)
+{
+	return (void *)select_task_rq_fair;
+}
+
+#undef select_task_rq_fair
+#define select_task_rq_fair cass_select_task_rq_wrapper
+#endif /* CONFIG_SCHED_CASS */
+
 /*
  * All the scheduling class methods:
  */
