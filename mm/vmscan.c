@@ -1926,76 +1926,19 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 
 	list_splice(&clean_pages, page_list);
 	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE,
-                -(long)stat.nr_lazyfree_fail);
-    return nr_reclaimed;
+			    -(long)nr_reclaimed);
+	/*
+	 * Since lazyfree pages are isolated from file LRU from the beginning,
+	 * they will rotate back to anonymous LRU in the end if it failed to
+	 * discard so isolated count will be mismatched.
+	 * Compensate the isolated count for both LRU lists.
+	 */
+	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_ANON,
+			    stat.nr_lazyfree_fail);
+	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE,
+			    -(long)stat.nr_lazyfree_fail);
+	return nr_reclaimed;
 }
-
-#if defined(CONFIG_OPLUS_NANDSWAP)
-unsigned long nswap_reclaim_page_list(struct list_head *page_list,
-                    struct vm_area_struct *vma, bool scan)
-{
-    unsigned long nr_reclaimed;
-    unsigned long nr_scan = 0;
-    struct page *page;
-    struct scan_control sc = {
-        .gfp_mask = GFP_KERNEL,
-        .priority = DEF_PRIORITY,
-        .may_writepage = 1,
-        .may_unmap = 1,
-        .may_swap = 1,
-    };
-
-    list_for_each_entry(page, page_list, lru) {
-        ClearPageActive(page);
-    }
-
-    nr_reclaimed = shrink_page_list(page_list, NULL, &sc, NULL, true);
-
-    while (!list_empty(page_list)) {
-        page = lru_to_page(page_list);
-        if (PageSwapCache(page) && !PageDirty(page))
-            nr_scan++;
-        list_del(&page->lru);
-        dec_node_page_state(page, NR_ISOLATED_ANON +
-                page_is_file_lru(page));
-        put_page(page);
-    }
-
-    return scan ? nr_scan : nr_reclaimed;
-}
-#endif
-
-#ifdef CONFIG_PROCESS_RECLAIM
-unsigned long reclaim_pages_from_list(struct list_head *page_list,
-                    struct vm_area_struct *vma)
-{
-    struct scan_control sc = {
-        .gfp_mask = GFP_KERNEL,
-        .priority = DEF_PRIORITY,
-        .may_writepage = 1,
-        .may_unmap = 1,
-        .may_swap = 1,
-    };
-
-    unsigned long nr_reclaimed;
-    struct page *page;
-
-    list_for_each_entry(page, page_list, lru)
-        ClearPageActive(page);
-
-    nr_reclaimed = shrink_page_list(page_list, NULL, &sc, NULL, true);
-
-    while (!list_empty(page_list)) {
-        page = lru_to_page(page_list);
-        list_del(&page->lru);
-        dec_node_page_state(page, NR_ISOLATED_ANON +
-                page_is_file_lru(page));
-        put_page(page);
-    }
-
-    return nr_reclaimed;
-}
-#endif
 
 /*
  * Update LRU sizes after isolating pages. The LRU size updates must
@@ -2798,11 +2741,6 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	unsigned long ap, fp;
 	enum lru_list lru;
 	bool balance_anon_file_reclaim = false;
-#if defined(CONFIG_OPLUS_NANDSWAP)
-	unsigned long totalswap = total_swap_pages;
-	if (nandswap_si)
-		totalswap -= nandswap_si->pages;
-#endif
 
 	/* If we have no swap space, do not bother scanning anon pages. */
 	if (!sc->may_swap || !can_reclaim_anon_pages(memcg, pgdat->node_id, sc)) {
