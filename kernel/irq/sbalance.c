@@ -33,6 +33,7 @@
 #include "../sched/sched.h"
 #include "internals.h"
 
+extern unsigned int hosterr_sleep;
 /* Perform IRQ balancing every POLL_MS milliseconds */
 #define POLL_MS CONFIG_IRQ_SBALANCE_POLL_MSEC
 
@@ -206,6 +207,8 @@ static void balance_irqs(void)
 	struct bal_irq *bi;
 	int cpu;
 
+	if (READ_ONCE(hosterr_sleep))
+		return;
 	cpus_read_lock();
 	rcu_read_lock();
 
@@ -226,6 +229,15 @@ static void balance_irqs(void)
 		per_cpu(cpu_cap, cpu) = cpu_rq(cpu)->cpu_capacity;
 
 	list_for_each_entry_rcu(bi, &bal_irq_list, node) {
+		struct irq_desc *desc = bi->desc;
+		unsigned int total_nr = 0;
+		int i;
+		for_each_possible_cpu(i)
+			total_nr += *per_cpu_ptr(desc->kstat_irqs, i);
+		if (total_nr <= bi->old_nr) {
+			bi->old_nr = total_nr;
+			continue;
+		}
 		if (!update_irq_data(bi, &cpu))
 			continue;
 

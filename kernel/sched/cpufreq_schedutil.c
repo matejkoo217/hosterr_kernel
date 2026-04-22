@@ -35,7 +35,7 @@ struct hosterr_cache {
 	unsigned int down_damping;
 };
 static unsigned int hosterr_max_mode	  = 0;
-static unsigned int hosterr_sleep		 = 0;
+unsigned int hosterr_sleep		 = 0;
 static unsigned int hosterr_down_damping  = 4;
 static unsigned int hosterr_frame_delay_ns  = 0;
 static unsigned int hosterr_frame_budget_ns = 8333333;
@@ -135,8 +135,7 @@ static void hosterr_update_cache(void)
 		changed = true;
 	}
 	spin_unlock_irqrestore(&hosterr_cache_lock, flags);
-	if (changed)
-		pr_info_ratelimited("[HOSTERR] parameters updated\n");
+	/*pr_info_ratelimited("[HOSTERR] parameters updated\n"); */
 }
 
 static void hosterr_frame_pressure_update(void)
@@ -144,44 +143,42 @@ static void hosterr_frame_pressure_update(void)
 	u64 now = ktime_get_ns();
 	u64 budget_ns = READ_ONCE(hosterr_frame_budget_ns);
 	u64 frame_delay = READ_ONCE(hosterr_frame_delay_ns);
-	u64 gate_ns;
+	u64 last_update = READ_ONCE(hosterr_last_pressure_update);
 	unsigned long boost, step, decay;
 	if (!budget_ns)
 		budget_ns = 16666666ULL;
-	gate_ns = budget_ns >> 1;
-	if (!gate_ns)
-		gate_ns = NSEC_PER_MSEC;
-	if ((now - READ_ONCE(hosterr_last_pressure_update)) < gate_ns)
+	if ((now - last_update) < (budget_ns >> 1))
 		return;
 	WRITE_ONCE(hosterr_last_pressure_update, now);
 	boost = READ_ONCE(hosterr_frame_boost);
 	if (frame_delay > budget_ns) {
-		step = SCHED_CAPACITY_SCALE / 8;
+		step = SCHED_CAPACITY_SCALE / 16;
 		if (frame_delay > (budget_ns << 1))
-			step = SCHED_CAPACITY_SCALE / 4;
+			step = SCHED_CAPACITY_SCALE / 8;
 		boost = min(boost + step, hosterr_frame_boost_max);
 	} else if (boost) {
 		decay = READ_ONCE(hosterr_frame_boost_decay);
 		if (!decay)
-			decay = 1;
+			decay = 3;
 		step = max(1UL, boost / decay);
 		boost = (step >= boost) ? 0UL : boost - step;
 	}
-	WRITE_ONCE(hosterr_frame_boost, boost);
+	smp_store_release(&hosterr_frame_boost, boost);
 }
 
 static unsigned long hosterr_bend_utilization(unsigned long util,
 					      unsigned long max)
 {
-	if (READ_ONCE(hosterr_frame_boost) > (SCHED_CAPACITY_SCALE / 16))
+	unsigned long boost = smp_load_acquire(&hosterr_frame_boost);
+	if (boost > (SCHED_CAPACITY_SCALE / 16))
 		return util;
 	if (!util || !max)
 		return 0;
 	if (util > max)
 		util = max;
-	if (util > (max * 7 / 8))
+	if (util > (max * 15 / 16))
 		return util;
-	return util - (util >> 3);
+	return util - (util >> 4);
 }
 
 static unsigned long hosterr_predict_util(struct sugov_policy *sg_policy,
@@ -192,9 +189,9 @@ static unsigned long hosterr_predict_util(struct sugov_policy *sg_policy,
 	long delta = (long)util - (long)prev;
 	unsigned long predicted;
 	if (delta > 0) {
-		predicted = util + (delta >> 1);
+		predicted = util + (delta >> 2);
 	} else if (delta < 0) {
-		predicted = prev - ((-delta) >> 1);
+		predicted = prev - ((-delta) >> 2);
 	} else {
 		predicted = util;
 	}
@@ -211,12 +208,12 @@ static unsigned long hosterr_dynamic_curve(struct cpufreq_policy *policy,
 {
 	unsigned long window = policy->max - policy->min;
 	unsigned long scale;
-	if (!window || window < (policy->cpuinfo.max_freq >> 2))
+	if (!window || window < (policy->cpuinfo.max_freq >> 1))
 		return util;
 	scale = (policy->max << 10) / window;
 	if (scale > (4UL << 10))
 		scale = (4UL << 10);
-	util += (util * scale) >> 12;
+	util += (util * scale) >> 13;
 	return min(util, max);
 }
 
@@ -224,10 +221,9 @@ static void hosterr_background_handler(struct work_struct *work)
 {
 	unsigned long flags;
 	int brightness = -1;
-	bool just_slept = false;
-	bool just_woke = false;
 	unsigned int check_interval = 1000;
 	hosterr_update_cache();
+	hosterr_frame_pressure_update();
 	if (!hosterr_bd)
 		hosterr_bd = backlight_device_get_by_name("panel0-backlight");
 	if (hosterr_bd) {
@@ -236,7 +232,6 @@ static void hosterr_background_handler(struct work_struct *work)
 		if (brightness == 0 && hosterr_cached.sleep == 0) {
 			hosterr_sleep = 1;
 			hosterr_cached.sleep = 1;
-			just_slept = true;
 			if (hosterr_cached.max_mode == 1) {
 				hosterr_max_mode_saved = true;
 				hosterr_max_mode = 0;
@@ -245,7 +240,6 @@ static void hosterr_background_handler(struct work_struct *work)
 		} else if (brightness > 0 && hosterr_cached.sleep == 1) {
 			hosterr_sleep = 0;
 			hosterr_cached.sleep = 0;
-			just_woke = true;
 			if (hosterr_max_mode_saved) {
 				hosterr_max_mode = 1;
 				hosterr_cached.max_mode = 1;
@@ -333,7 +327,7 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
 		if (!sg_cpu->iowait_boost) {
 			sg_cpu->iowait_boost = IOWAIT_BOOST_MIN;
 		} else {
-			sg_cpu->iowait_boost <<= 1;
+			sg_cpu->iowait_boost += (sg_cpu->max >> 3);
 			if (sg_cpu->iowait_boost > IOWAIT_BOOST_MAX)
 				sg_cpu->iowait_boost = IOWAIT_BOOST_MAX;
 		}
@@ -505,9 +499,6 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 
 	hosterr_frame_pressure_update();
 
-	if (util > (max * 3 / 4))
-		util = max;
-
 	frame_boost = READ_ONCE(hosterr_frame_boost);
 	if (frame_boost) {
 		if (frame_boost >= (max - util))
@@ -517,9 +508,9 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	}
 
 	if (frame_delay_ns > frame_budget_ns) {
-		unsigned long extra = max >> 3;
+		unsigned long extra = max >> 4;
 		if (frame_delay_ns > (frame_budget_ns << 1))
-			extra = max >> 2;
+			extra = max >> 3;
 		if (util + extra >= max)
 			util = max;
 		else
@@ -541,7 +532,15 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	util = map_util_perf(util);
 	freq = map_util_freq(util, policy->cpuinfo.max_freq, max);
 
-	if (max < (SCHED_CAPACITY_SCALE * 3 / 4)) {
+	if (policy->cpu == 7) {
+		if (freq > prev_raw) {
+			smooth_weight_prev = 9;
+			smooth_weight_new  = 1;
+		} else {
+			smooth_weight_prev = 0;
+			smooth_weight_new  = 10;
+		}
+	} else if (max < (SCHED_CAPACITY_SCALE * 3 / 4)) {
 		smooth_weight_prev = 7;
 		smooth_weight_new  = 3;
 	} else {
@@ -549,13 +548,22 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 		smooth_weight_new  = 7;
 	}
 
-	if (prev_raw != 0 && (sg_policy->is_oscillating || freq < prev_raw)) {
-		freq = ((prev_raw * smooth_weight_prev) + (freq * smooth_weight_new)) / 10;
+	if (prev_raw != 0 && (sg_policy->is_oscillating || freq < prev_raw || (policy->cpu == 7 && freq > prev_raw))) {
+		freq = ((prev_raw * smooth_weight_prev) + (freq * smooth_weight_new));
+		freq = (freq * 205) >> 11;
+	}
+	if (prev_raw != 0 && freq > prev_raw && !is_max) {
+		freq = prev_raw + ((freq - prev_raw) >> 1);
 	}
 
 	damping = READ_ONCE(hosterr_down_damping);
-	if (damping > 1 && prev_raw != 0 && freq < prev_raw)
-		freq = ((prev_raw * (damping - 1)) + freq) / damping;
+	if (damping > 1 && prev_raw != 0 && freq < prev_raw) {
+		if (damping == 4) {
+			freq = ((prev_raw * 3) + freq) >> 2;
+		} else {
+			freq = ((prev_raw * (damping - 1)) + freq) / damping;
+		}
+	}
 
 resolve_freq:
 	if (policy->min > policy->cpuinfo.min_freq)
@@ -611,13 +619,12 @@ static inline void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu)
 static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
 					      u64 time, unsigned int flags)
 {
+	if (!sugov_should_update_freq(sg_cpu->sg_policy, time))
+		return false;
 	sugov_iowait_boost(sg_cpu, time, flags);
 	sg_cpu->last_update = time;
 
 	ignore_dl_rate_limit(sg_cpu);
-
-	if (!sugov_should_update_freq(sg_cpu->sg_policy, time))
-		return false;
 
 	sugov_get_util(sg_cpu);
 	sg_cpu->util = sugov_iowait_apply(sg_cpu, time, sg_cpu->util, sg_cpu->max);
