@@ -74,6 +74,14 @@ config DEVFREQ_GOV_PASSIVE
 	  through sysfs entries. The passive governor recommends that
 	  devfreq device uses the OPP table to get the frequency/voltage.
 
+config GPU_CONTROL_BG
+	bool "GPU Control Background Handler"
+	depends on PM_DEVFREQ
+	help
+	  Background handler for GPU frequency control. Allows setting
+	  min and max frequency brackets for the GPU regardless of the
+	  active governor.
+
 comment "DEVFREQ Drivers"
 
 config ARM_EXYNOS_BUS_DEVFREQ

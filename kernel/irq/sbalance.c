@@ -34,6 +34,7 @@
 #include "internals.h"
 
 extern unsigned int hosterr_sleep;
+extern unsigned int hosterr_core_on[8];
 /* Perform IRQ balancing every POLL_MS milliseconds */
 #define POLL_MS CONFIG_IRQ_SBALANCE_POLL_MSEC
 
@@ -165,23 +166,45 @@ static int move_irq_to_cpu(struct bal_irq *bi, int cpu)
 	return ret;
 }
 
-static unsigned int scale_intrs(unsigned int intrs, int cpu)
+static unsigned int scale_intrs(unsigned int intrs, int cpu, unsigned long max_cap)
 {
-	/* Scale the number of interrupts to this CPU's current capacity */
-	return intrs * SCHED_CAPACITY_SCALE / per_cpu(cpu_cap, cpu);
+	unsigned long cap = per_cpu(cpu_cap, cpu);
+	unsigned int scaled = intrs * SCHED_CAPACITY_SCALE / max(cap, 1UL);
+
+	/*
+	 * Prime Core Boost: If this is the highest index core and it's
+	 * a Big/Prime core, give it a 0.5x bias to make it the absolute
+	 * first choice for receiving IRQs.
+	 */
+	if (cpu == (nr_cpu_ids - 1) && cap >= (max_cap / 2))
+		return scaled / 2;
+
+	/*
+	 * Apply a 2x bias to Little cores. This encourages the balancer
+	 * to move work to Big/Prime cores first, but keeps Little cores
+	 * available as a "safety valve" if the Big cores are overwhelmed.
+	 */
+	if (cap < (max_cap / 2))
+		return scaled * 2;
+
+	return scaled;
 }
 
 /* Returns true if IRQ balancing should stop */
 static bool find_min_bd(const cpumask_t *mask, unsigned int max_intrs,
+			int max_cpu, unsigned long system_max_cap,
 			struct bal_domain **min_bd)
 {
 	unsigned int intrs, min_intrs = UINT_MAX;
+	unsigned int thresh = IRQ_SCALED_THRESH;
+	unsigned int max_cap = 0;
+	int best_cpu = -1;
 	struct bal_domain *bd;
 	int cpu;
 
 	for_each_cpu(cpu, mask) {
 		bd = per_cpu_ptr(&balance_data, cpu);
-		intrs = scale_intrs(bd->intrs, bd->cpu);
+		intrs = scale_intrs(bd->intrs, bd->cpu, system_max_cap);
 
 		/* Terminate when the formerly-max CPU isn't the max anymore */
 		if (intrs > max_intrs)
@@ -191,11 +214,34 @@ static bool find_min_bd(const cpumask_t *mask, unsigned int max_intrs,
 		if (intrs < min_intrs) {
 			min_intrs = intrs;
 			*min_bd = bd;
+			max_cap = per_cpu(cpu_cap, cpu);
+			best_cpu = cpu;
+		} else if (intrs == min_intrs) {
+			/*
+			 * Tie-break: Prefer the core with the highest index
+			 * (usually the Prime core) to handle the load.
+			 */
+			if (cpu > best_cpu) {
+				*min_bd = bd;
+				max_cap = per_cpu(cpu_cap, cpu);
+				best_cpu = cpu;
+			}
 		}
 	}
 
-	/* Don't balance if IRQs are already balanced evenly enough */
-	return max_intrs - min_intrs < IRQ_SCALED_THRESH;
+	/*
+	 * If moving from a Little core to a Big core, ignore the threshold
+	 * to ensure even minor IRQ activity is migrated to stronger cores.
+	 */
+	if (per_cpu(cpu_cap, max_cpu) < (system_max_cap / 2) &&
+	    per_cpu(cpu_cap, (*min_bd)->cpu) >= (system_max_cap / 2))
+		return false;
+
+	/*
+	 * Don't balance if IRQs are already balanced evenly enough.
+	 */
+	thresh = thresh * per_cpu(cpu_cap, max_cpu) / SCHED_CAPACITY_SCALE;
+	return max_intrs - min_intrs < max(thresh, 1U);
 }
 
 static void balance_irqs(void)
@@ -203,6 +249,7 @@ static void balance_irqs(void)
 	static cpumask_t cpus;
 	struct bal_domain *bd, *max_bd, *min_bd;
 	unsigned int intrs, max_intrs;
+	unsigned long system_max_cap = 0;
 	bool moved_irq = false;
 	struct bal_irq *bi;
 	int cpu;
@@ -214,19 +261,22 @@ static void balance_irqs(void)
 
 	/* Find the available CPUs for balancing, if there are any */
 	cpumask_andnot(&cpus, cpu_active_mask, &cpu_exclude_mask);
+	for_each_cpu(cpu, &cpus) {
+	    if (!READ_ONCE(hosterr_core_on[cpu]))
+	        cpumask_clear_cpu(cpu, &cpus);
+	}
 	if (unlikely(cpumask_weight(&cpus) <= 1))
 		goto unlock;
 
 	/*
-	 * Get the current capacity for each CPU. This is adjusted for time
-	 * spent processing IRQs, RT-task time, and thermal pressure. We don't
-	 * exclude time spent processing IRQs when balancing because balancing
-	 * is only done using interrupt counts rather than time spent in
-	 * interrupts. That way, time spent processing each interrupt is
-	 * considered when balancing.
+	 * Get the maximum capacity for each CPU and find the system maximum.
 	 */
-	for_each_cpu(cpu, &cpus)
-		per_cpu(cpu_cap, cpu) = cpu_rq(cpu)->cpu_capacity;
+	for_each_cpu(cpu, &cpus) {
+		unsigned long cap = capacity_orig_of(cpu);
+		per_cpu(cpu_cap, cpu) = cap;
+		if (cap > system_max_cap)
+			system_max_cap = cap;
+	}
 
 	list_for_each_entry_rcu(bi, &bal_irq_list, node) {
 		struct irq_desc *desc = bi->desc;
@@ -262,18 +312,30 @@ static void balance_irqs(void)
 
 	/* Find the most interrupt-heavy CPU with movable IRQs */
 	while (1) {
+		int worst_cpu = -1;
 		max_intrs = 0;
+		max_bd = NULL;
 		for_each_cpu(cpu, &cpus) {
 			bd = per_cpu_ptr(&balance_data, cpu);
-			intrs = scale_intrs(bd->intrs, bd->cpu);
+			intrs = scale_intrs(bd->intrs, bd->cpu, system_max_cap);
 			if (intrs > max_intrs) {
 				max_intrs = intrs;
 				max_bd = bd;
+				worst_cpu = cpu;
+			} else if (intrs == max_intrs && max_intrs > 0) {
+				/*
+				 * Prefer moving from CPU with lower index
+				 * (usually the Little cores) first.
+				 */
+				if (cpu < worst_cpu) {
+					max_bd = bd;
+					worst_cpu = cpu;
+				}
 			}
 		}
 
-		/* No balancing to do if there aren't any movable IRQs */
-		if (unlikely(!max_intrs))
+		/* No balancing to do if there aren't any movable IRQs or no load */
+		if (unlikely(!max_bd || !max_bd->intrs))
 			goto unlock;
 
 		/* Ensure the heaviest CPU has IRQs which can be moved away */
@@ -293,7 +355,7 @@ try_next_heaviest:
 	}
 
 	/* Find the CPU with the lowest relative interrupt count */
-	if (find_min_bd(&cpus, max_intrs, &min_bd))
+	if (find_min_bd(&cpus, max_intrs, max_bd->cpu, system_max_cap, &min_bd))
 		goto unlock;
 
 	/* Sort movable IRQs in descending order of number of new interrupts */
@@ -302,7 +364,7 @@ try_next_heaviest:
 	/* Push IRQs away from the heaviest CPU to the least-heavy CPUs */
 	list_for_each_entry(bi, &max_bd->movable_irqs, move_node) {
 		/* Skip this IRQ if it would just overload the target CPU */
-		intrs = scale_intrs(min_bd->intrs + bi->delta_nr, min_bd->cpu);
+		intrs = scale_intrs(min_bd->intrs + bi->delta_nr, min_bd->cpu, system_max_cap);
 		if (intrs >= max_intrs)
 			continue;
 
@@ -316,10 +378,10 @@ try_next_heaviest:
 		/* Update the counts and recalculate the max scaled count */
 		min_bd->intrs += bi->delta_nr;
 		max_bd->intrs -= bi->delta_nr;
-		max_intrs = scale_intrs(max_bd->intrs, max_bd->cpu);
+		max_intrs = scale_intrs(max_bd->intrs, max_bd->cpu, system_max_cap);
 
 		/* Recheck for the least-heavy CPU since it may have changed */
-		if (find_min_bd(&cpus, max_intrs, &min_bd))
+		if (find_min_bd(&cpus, max_intrs, max_bd->cpu, system_max_cap, &min_bd))
 			break;
 	}
 

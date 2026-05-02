@@ -27,36 +27,99 @@
 #endif
 #define IOWAIT_BOOST_MAX		SCHED_CAPACITY_SCALE
 #define IOWAIT_BOOST_DECAY_NS	   (8ULL * NSEC_PER_MSEC)
-#define HOSTERR_DEFAULT_RATE_LIMIT_US   1000U
+#define HOSTERR_DEFAULT_RATE_LIMIT_US   2000U
+#define HOSTERR_NUM_CORES       8
+#define HOSTERR_CORE_WHITELIST  ((1U << 0) | (1U << 1))
 
 struct hosterr_cache {
 	unsigned int max_mode;
 	unsigned int sleep;
 	unsigned int down_damping;
+	unsigned int bend_shift;
 };
-static unsigned int hosterr_max_mode	  = 0;
+unsigned int hosterr_max_mode	  = 0;
+
+ATOMIC_NOTIFIER_HEAD(hosterr_max_mode_notifier_list);
+
+static void update_hosterr_max_mode(unsigned int val)
+{
+	if (READ_ONCE(hosterr_max_mode) == val)
+		return;
+	WRITE_ONCE(hosterr_max_mode, val);
+	atomic_notifier_call_chain(&hosterr_max_mode_notifier_list, val, NULL);
+}
+
 unsigned int hosterr_sleep		 = 0;
 static unsigned int hosterr_down_damping  = 4;
-static unsigned int hosterr_frame_delay_ns  = 0;
-static unsigned int hosterr_frame_budget_ns = 8333333;
-static unsigned long hosterr_frame_boost	  = 0;
-static unsigned long hosterr_frame_boost_decay = 3;
-static unsigned long hosterr_frame_boost_max   = SCHED_CAPACITY_SCALE / 2;
-static u64 hosterr_last_pressure_update = 0;
+static unsigned int hosterr_bend_shift	 = 3;
 #define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
-module_param_named(max_mode,		hosterr_max_mode,		uint,  0644);
-module_param_named(sleep,		   hosterr_sleep,		   uint,  0644);
-module_param_named(down_damping,	hosterr_down_damping,	uint,  0644);
-module_param_named(frame_delay_ns,  hosterr_frame_delay_ns,  uint,  0644);
-module_param_named(frame_budget_ns, hosterr_frame_budget_ns, uint,  0644);
-
 static struct backlight_device *hosterr_bd = NULL;
 static bool hosterr_max_mode_saved = false;
 static struct hosterr_cache hosterr_cached;
 static DEFINE_SPINLOCK(hosterr_cache_lock);
 static struct delayed_work hosterr_background_work;
-static bool hosterr_timer_running = false;
+static atomic_t hosterr_timer_running = ATOMIC_INIT(0);
 static bool hosterr_works_init = false;
+static int hosterr_zero_brightness_count = 0;
+static atomic_t hosterr_brightness_cached = ATOMIC_INIT(-1);
+static DEFINE_MUTEX(hosterr_init_lock);
+static int hosterr_policy_count = 0;
+static bool hosterr_bl_registered = false;
+static enum cpuhp_state hosterr_hp_state = 0;
+
+unsigned int hosterr_core_on[HOSTERR_NUM_CORES] = {
+    [0 ... HOSTERR_NUM_CORES - 1] = 1
+};
+
+#define HOSTERR_REQ_USER   (1U << 0)
+#define HOSTERR_REQ_SYSTEM (1U << 1)
+
+static unsigned int hosterr_core_reqs[HOSTERR_NUM_CORES] = {
+	[0 ... HOSTERR_NUM_CORES - 1] = HOSTERR_REQ_USER | HOSTERR_REQ_SYSTEM
+};
+
+static int hosterr_core_control(unsigned int cpu, unsigned int mask, bool on)
+{
+	unsigned long flags;
+	unsigned int old_reqs, new_reqs;
+	bool should_be_on, was_on;
+	struct device *dev = get_cpu_device(cpu);
+	int ret = 0;
+	if (!dev || cpu >= HOSTERR_NUM_CORES)
+		return -ENODEV;
+	if (mask == HOSTERR_REQ_USER && !on && (HOSTERR_CORE_WHITELIST & (1U << cpu)))
+		return -EPERM;
+	spin_lock_irqsave(&hosterr_cache_lock, flags);
+	old_reqs = hosterr_core_reqs[cpu];
+	if (on)
+		new_reqs = old_reqs | mask;
+	else
+		new_reqs = old_reqs & ~mask;
+	if (new_reqs == old_reqs) {
+		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+		return 0;
+	}
+	hosterr_core_reqs[cpu] = new_reqs;
+	should_be_on = (new_reqs == (HOSTERR_REQ_USER | HOSTERR_REQ_SYSTEM));
+	was_on = (old_reqs == (HOSTERR_REQ_USER | HOSTERR_REQ_SYSTEM));
+	if (should_be_on == was_on) {
+		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+		return 0;
+	}
+	hosterr_core_on[cpu] = should_be_on;
+	spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+	if (should_be_on) {
+		ret = device_online(dev);
+		if (ret) {
+			spin_lock_irqsave(&hosterr_cache_lock, flags);
+			hosterr_core_on[cpu] = 0;
+			spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+		}
+	} else {
+		ret = device_offline(dev);
+	}
+	return ret;
+}
 
 struct sugov_tunables {
 	struct gov_attr_set	attr_set;
@@ -82,6 +145,8 @@ struct sugov_policy {
 	unsigned int		osc_change_count;
 	bool			is_oscillating;
 	unsigned int		target_freq_smoothed;
+	unsigned int		calm_window_count;
+	unsigned int		dynamic_curve_scale;
 
 	/* The next fields are only needed if fast switch cannot be used: */
 	struct			irq_work irq_work;
@@ -117,185 +182,263 @@ struct sugov_cpu {
 static DEFINE_PER_CPU(struct sugov_cpu, sugov_cpu);
 
 /************************ Hosterr Internals ***********************/
-static void hosterr_update_cache(void)
+#define HOSTERR_PARAM_SYNC_SET(name, var) \
+static int hosterr_##name##_sync_set(const char *val, const struct kernel_param *kp) \
+{ \
+	unsigned int v; \
+	unsigned long flags; \
+	int ret = kstrtouint(val, 10, &v); \
+	if (ret) \
+		return ret; \
+	ret = param_set_uint(val, kp); \
+	if (!ret) { \
+		spin_lock_irqsave(&hosterr_cache_lock, flags); \
+		hosterr_cached.name = var; \
+		if (!strcmp(#name, "max_mode")) \
+			update_hosterr_max_mode(var); \
+		spin_unlock_irqrestore(&hosterr_cache_lock, flags); \
+	} \
+	return ret; \
+} \
+static const struct kernel_param_ops hosterr_##name##_ops = { \
+	.set = hosterr_##name##_sync_set, \
+	.get = param_get_uint, \
+};
+#define HOSTERR_PARAM_SYNC_SET_BOUNDS(name, var, min_val, max_val) \
+static int hosterr_##name##_sync_set_bounds(const char *val, const struct kernel_param *kp) \
+{ \
+    unsigned int v; \
+    unsigned long flags; \
+    int ret = kstrtouint(val, 10, &v); \
+    if (ret) \
+        return ret; \
+    if (v < (min_val) || v > (max_val)) \
+        return -EINVAL; \
+    ret = param_set_uint(val, kp); \
+    if (!ret) { \
+        spin_lock_irqsave(&hosterr_cache_lock, flags); \
+        hosterr_cached.name = var; \
+        spin_unlock_irqrestore(&hosterr_cache_lock, flags); \
+    } \
+    return ret; \
+} \
+static const struct kernel_param_ops hosterr_##name##_ops = { \
+	.set = hosterr_##name##_sync_set_bounds, \
+	.get = param_get_uint, \
+};
+HOSTERR_PARAM_SYNC_SET(max_mode, hosterr_max_mode)
+HOSTERR_PARAM_SYNC_SET(sleep, hosterr_sleep)
+HOSTERR_PARAM_SYNC_SET(bend_shift, hosterr_bend_shift)
+HOSTERR_PARAM_SYNC_SET_BOUNDS(down_damping, hosterr_down_damping, 2, 32)
+module_param_cb(max_mode, &hosterr_max_mode_ops, &hosterr_max_mode, 0644);
+module_param_cb(sleep, &hosterr_sleep_ops, &hosterr_sleep, 0644);
+module_param_cb(bend_shift, &hosterr_bend_shift_ops, &hosterr_bend_shift, 0644);
+module_param_cb(down_damping, &hosterr_down_damping_ops, &hosterr_down_damping, 0644);
+
+static int hosterr_cpu_online_prep(unsigned int cpu)
 {
-	unsigned long flags;
-	bool changed = false;
-	spin_lock_irqsave(&hosterr_cache_lock, flags);
-	if (hosterr_cached.max_mode != hosterr_max_mode) {
-		hosterr_cached.max_mode = hosterr_max_mode;
-		changed = true;
-	}
-	if (hosterr_cached.sleep != hosterr_sleep) {
-		hosterr_cached.sleep = hosterr_sleep;
-		changed = true;
-	}
-	if (hosterr_cached.down_damping != hosterr_down_damping) {
-		hosterr_cached.down_damping = hosterr_down_damping;
-		changed = true;
-	}
-	spin_unlock_irqrestore(&hosterr_cache_lock, flags);
-	/*pr_info_ratelimited("[HOSTERR] parameters updated\n"); */
+    if (cpu >= HOSTERR_NUM_CORES)
+        return 0;
+    if (!READ_ONCE(hosterr_core_on[cpu])) {
+        return -EINVAL;
+    }
+    return 0;
 }
 
-static void hosterr_frame_pressure_update(void)
-{
-	u64 now = ktime_get_ns();
-	u64 budget_ns = READ_ONCE(hosterr_frame_budget_ns);
-	u64 frame_delay = READ_ONCE(hosterr_frame_delay_ns);
-	u64 last_update = READ_ONCE(hosterr_last_pressure_update);
-	unsigned long boost, step, decay;
-	if (!budget_ns)
-		budget_ns = 16666666ULL;
-	if ((now - last_update) < (budget_ns >> 1))
-		return;
-	WRITE_ONCE(hosterr_last_pressure_update, now);
-	boost = READ_ONCE(hosterr_frame_boost);
-	if (frame_delay > budget_ns) {
-		step = SCHED_CAPACITY_SCALE / 16;
-		if (frame_delay > (budget_ns << 1))
-			step = SCHED_CAPACITY_SCALE / 8;
-		boost = min(boost + step, hosterr_frame_boost_max);
-	} else if (boost) {
-		decay = READ_ONCE(hosterr_frame_boost_decay);
-		if (!decay)
-			decay = 3;
-		step = max(1UL, boost / decay);
-		boost = (step >= boost) ? 0UL : boost - step;
-	}
-	smp_store_release(&hosterr_frame_boost, boost);
-}
+#define HOSTERR_CORE_PARAM(n) \
+static int hosterr_core##n##_set(const char *val, \
+                                 const struct kernel_param *kp) \
+{ \
+    unsigned int v; \
+    int ret; \
+    ret = kstrtouint(val, 10, &v); \
+    if (ret) \
+        return ret; \
+    return hosterr_core_control(n, HOSTERR_REQ_USER, !!v); \
+} \
+static const struct kernel_param_ops hosterr_core##n##_ops = { \
+    .set = hosterr_core##n##_set, \
+    .get = param_get_uint, \
+}; \
+module_param_cb(core##n##_on, &hosterr_core##n##_ops, \
+                &hosterr_core_on[n], 0644)
+HOSTERR_CORE_PARAM(0);
+HOSTERR_CORE_PARAM(1);
+HOSTERR_CORE_PARAM(2);
+HOSTERR_CORE_PARAM(3);
+HOSTERR_CORE_PARAM(4);
+HOSTERR_CORE_PARAM(5);
+HOSTERR_CORE_PARAM(6);
+HOSTERR_CORE_PARAM(7);
 
-static unsigned long hosterr_bend_utilization(unsigned long util,
-					      unsigned long max)
+static inline unsigned long hosterr_bend_utilization(unsigned long util,
+						     unsigned long max)
 {
-	unsigned long boost = smp_load_acquire(&hosterr_frame_boost);
-	if (boost > (SCHED_CAPACITY_SCALE / 16))
-		return util;
+	unsigned int shift;
 	if (!util || !max)
 		return 0;
 	if (util > max)
 		util = max;
-	if (util > (max * 15 / 16))
+	shift = READ_ONCE(hosterr_cached.bend_shift);
+	if (!shift || util >= mult_frac(max, 7, 8))
 		return util;
-	return util - (util >> 4);
+	return util - (util >> shift);
 }
 
-static unsigned long hosterr_predict_util(struct sugov_policy *sg_policy,
-				      unsigned long util,
-				      unsigned long max)
+#define PREDICT_NOISE_FLOOR (SCHED_CAPACITY_SCALE >> 6)
+#define OSC_MIN_DELTA(sg) ((sg)->policy->cpuinfo.max_freq >> 4) // ~6% of max
+
+static inline unsigned long hosterr_predict_util(struct sugov_policy *sg_policy,
+                                      unsigned long util, unsigned long max)
 {
-	unsigned long prev = sg_policy->last_util;
-	long delta = (long)util - (long)prev;
-	unsigned long predicted;
-	if (delta > 0) {
-		predicted = util + (delta >> 2);
-	} else if (delta < 0) {
-		predicted = prev - ((-delta) >> 2);
-	} else {
-		predicted = util;
-	}
-
-	if (predicted > max)
-		predicted = max;
-	sg_policy->last_util = util;
-	return predicted;
+    long delta = (long)util - (long)sg_policy->last_util;
+    long predicted;
+    if (abs(delta) > PREDICT_NOISE_FLOOR)
+        predicted = (long)util + (delta >> 3);
+    else
+        predicted = (long)util;
+    if (predicted > (long)max)
+        predicted = max;
+    if (predicted < 0)
+        predicted = 0;
+    sg_policy->last_util = util;
+    return (unsigned long)predicted;
 }
 
-static unsigned long hosterr_dynamic_curve(struct cpufreq_policy *policy,
+static inline unsigned long hosterr_dynamic_curve(struct sugov_policy *sg_policy,
 				       unsigned long util,
 				       unsigned long max)
 {
-	unsigned long window = policy->max - policy->min;
-	unsigned long scale;
-	if (!window || window < (policy->cpuinfo.max_freq >> 1))
+	unsigned int scale = sg_policy->dynamic_curve_scale;
+
+	if (!scale)
 		return util;
-	scale = (policy->max << 10) / window;
-	if (scale > (4UL << 10))
-		scale = (4UL << 10);
-	util += (util * scale) >> 13;
+	util += (unsigned long)((u64)util * scale >> 13);
 	return min(util, max);
 }
 
+static int hosterr_bl_notifier(struct notifier_block *nb,
+                unsigned long event, void *data)
+{
+    struct backlight_device *bd = data;
+    if (!bd || strcmp(dev_name(&bd->dev), "panel0-backlight"))
+        return NOTIFY_DONE;
+    if (event == BACKLIGHT_UPDATED) {
+        atomic_set(&hosterr_brightness_cached, bd->props.brightness);
+        if (bd->props.brightness > 0 && READ_ONCE(hosterr_sleep)) {
+            mod_delayed_work(system_wq, &hosterr_background_work, 0);
+        }
+    }
+    return NOTIFY_OK;
+}
+static struct notifier_block hosterr_bl_nb = {
+	.notifier_call = hosterr_bl_notifier,
+};
+
 static void hosterr_background_handler(struct work_struct *work)
 {
-	unsigned long flags;
-	int brightness = -1;
-	unsigned int check_interval = 1000;
-	hosterr_update_cache();
-	hosterr_frame_pressure_update();
-	if (!hosterr_bd)
-		hosterr_bd = backlight_device_get_by_name("panel0-backlight");
-	if (hosterr_bd) {
-		brightness = hosterr_bd->props.brightness;
-		spin_lock_irqsave(&hosterr_cache_lock, flags);
-		if (brightness == 0 && hosterr_cached.sleep == 0) {
-			hosterr_sleep = 1;
-			hosterr_cached.sleep = 1;
-			if (hosterr_cached.max_mode == 1) {
-				hosterr_max_mode_saved = true;
-				hosterr_max_mode = 0;
-				hosterr_cached.max_mode = 0;
-			}
-		} else if (brightness > 0 && hosterr_cached.sleep == 1) {
-			hosterr_sleep = 0;
-			hosterr_cached.sleep = 0;
-			if (hosterr_max_mode_saved) {
-				hosterr_max_mode = 1;
-				hosterr_cached.max_mode = 1;
-				hosterr_max_mode_saved = false;
-			}
-		}
-		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
-	}
-	if (hosterr_timer_running)
-		schedule_delayed_work(&hosterr_background_work,
-				      msecs_to_jiffies(check_interval));
+    unsigned long flags;
+    int brightness;
+    int target_core7_state = -1;
+    unsigned int check_interval = 2000;
+    struct backlight_device *bd_local;
+    bd_local = smp_load_acquire(&hosterr_bd);
+    if (!bd_local) {
+        mutex_lock(&hosterr_init_lock);
+        bd_local = hosterr_bd;
+        if (!bd_local) {
+            bd_local = backlight_device_get_by_name("panel0-backlight");
+            if (bd_local) {
+                backlight_register_notifier(&hosterr_bl_nb);
+                hosterr_bl_registered = true;
+                smp_store_release(&hosterr_bd, bd_local);
+            }
+        }
+        mutex_unlock(&hosterr_init_lock);
+    }
+    if (bd_local) {
+        brightness = bd_local->props.brightness;
+        atomic_set(&hosterr_brightness_cached, brightness);
+    } else {
+        brightness = atomic_read(&hosterr_brightness_cached);
+    }
+    if (brightness < 0)
+        goto reschedule;
+    spin_lock_irqsave(&hosterr_cache_lock, flags);
+    if (brightness == 0 && hosterr_cached.sleep == 0) {
+        hosterr_zero_brightness_count++;
+        if (hosterr_zero_brightness_count >= 2) {
+            hosterr_zero_brightness_count = 0;
+            WRITE_ONCE(hosterr_sleep, 1);
+            hosterr_cached.sleep = 1;
+            target_core7_state = 0;
+            if (hosterr_cached.max_mode == 1) {
+                hosterr_max_mode_saved = true;
+                update_hosterr_max_mode(0);
+                hosterr_cached.max_mode = 0;
+            }
+        }
+    } else if (brightness > 0 && (hosterr_cached.sleep == 1 || !READ_ONCE(hosterr_core_on[7]))) {
+        hosterr_zero_brightness_count = 0;
+        WRITE_ONCE(hosterr_sleep, 0);
+        hosterr_cached.sleep = 0;
+        target_core7_state = 1;
+        if (hosterr_max_mode_saved) {
+            update_hosterr_max_mode(1);
+            hosterr_cached.max_mode = 1;
+            hosterr_max_mode_saved = false;
+        }
+    } else {
+        hosterr_zero_brightness_count = 0;
+    }
+    spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+    if (target_core7_state != -1)
+        hosterr_core_control(7, HOSTERR_REQ_SYSTEM, !!target_core7_state);
+
+reschedule:
+    if (atomic_read(&hosterr_timer_running)) {
+        schedule_delayed_work(&hosterr_background_work,
+                              msecs_to_jiffies(check_interval));
+    }
 }
 
 static int hosterr_pm_callback(struct notifier_block *nb, unsigned long action,
 				   void *ptr)
 {
-	unsigned long flags;
-	bool do_sleep = false;
-	bool do_wake = false;
-	switch (action) {
-	case PM_SUSPEND_PREPARE:
-		hosterr_timer_running = false;
-		cancel_delayed_work_sync(&hosterr_background_work);
-		spin_lock_irqsave(&hosterr_cache_lock, flags);
-		if (hosterr_cached.sleep == 0)
-			do_sleep = true;
-		hosterr_sleep = 1;
-		hosterr_cached.sleep = 1;
-		if (hosterr_cached.max_mode == 1) {
-			hosterr_max_mode_saved = true;
-			hosterr_max_mode = 0;
-			hosterr_cached.max_mode = 0;
-		} else {
-			hosterr_max_mode_saved = false;
-		}
-		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
-		hosterr_update_cache();
-		break;
-	case PM_POST_SUSPEND:
-		hosterr_timer_running = true;
-		spin_lock_irqsave(&hosterr_cache_lock, flags);
-		if (hosterr_max_mode_saved) {
-			hosterr_max_mode = 1;
-			hosterr_cached.max_mode = 1;
-			hosterr_max_mode_saved = false;
-		}
-		if (hosterr_cached.sleep == 1)
-			do_wake = true;
-		WRITE_ONCE(hosterr_sleep, 0);
-		hosterr_cached.sleep = 0;
-		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
-		schedule_delayed_work(&hosterr_background_work, msecs_to_jiffies(500));
-		break;
-	}
-
-	return NOTIFY_OK;
+    unsigned long flags;
+    switch (action) {
+    case PM_SUSPEND_PREPARE:
+        spin_lock_irqsave(&hosterr_cache_lock, flags);
+        WRITE_ONCE(hosterr_sleep, 1);
+        hosterr_cached.sleep = 1;
+        if (hosterr_cached.max_mode == 1) {
+            hosterr_max_mode_saved = true;
+            update_hosterr_max_mode(0);
+            hosterr_cached.max_mode = 0;
+        } else {
+            hosterr_max_mode_saved = false;
+        }
+        spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+        atomic_set(&hosterr_timer_running, 0);
+        cancel_delayed_work_sync(&hosterr_background_work);
+        break;
+    case PM_POST_SUSPEND:
+        atomic_set(&hosterr_timer_running, 1);
+        spin_lock_irqsave(&hosterr_cache_lock, flags);
+        if (hosterr_max_mode_saved) {
+            update_hosterr_max_mode(1);
+            hosterr_cached.max_mode = 1;
+            hosterr_max_mode_saved = false;
+        }
+        WRITE_ONCE(hosterr_sleep, 0);
+        hosterr_cached.sleep = 0;
+        hosterr_zero_brightness_count = 0;
+        spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+        hosterr_core_control(7, HOSTERR_REQ_SYSTEM, true);
+        queue_delayed_work(system_wq, &hosterr_background_work, msecs_to_jiffies(500));
+        break;
+    }
+    return NOTIFY_OK;
 }
 static struct notifier_block hosterr_pm_nb = {
 	.notifier_call = hosterr_pm_callback,
@@ -366,51 +509,31 @@ static unsigned long sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
 
 static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 {
-	s64 delta_ns;
-	s64 rate_limit_ns;
-	/*
-	 * Since cpufreq_update_util() is called with rq->lock held for
-	 * the @target_cpu, our per-CPU data is fully serialized.
-	 *
-	 * However, drivers cannot in general deal with cross-CPU
-	 * requests, so while get_next_freq() will work, our
-	 * sugov_update_commit() call may not for the fast switching platforms.
-	 *
-	 * Hence stop here for remote requests if they aren't supported
-	 * by the hardware, as calculating the frequency is pointless if
-	 * we cannot in fact act on it.
-	 *
-	 * This is needed on the slow switching platforms too to prevent CPUs
-	 * going offline from leaving stale IRQ work items behind.
-	 */
-	if (!cpufreq_this_cpu_can_update(sg_policy->policy))
-		return false;
+    s64 delta_ns;
+    s64 rate_limit_ns;
 
-	if (unlikely(READ_ONCE(sg_policy->limits_changed))) {
-		WRITE_ONCE(sg_policy->limits_changed, false);
-		sg_policy->need_freq_update = true;
+    if (!cpufreq_this_cpu_can_update(sg_policy->policy))
+        return false;
 
-		/*
-		 * The above limits_changed update must occur before the reads
-		 * of policy limits in cpufreq_driver_resolve_freq() or a policy
-		 * limits update might be missed, so use a memory barrier to
-		 * ensure it.
-		 *
-		 * This pairs with the write memory barrier in sugov_limits().
-		 */
-		smp_mb();
-
-		return true;
-	}
-
-	rate_limit_ns = READ_ONCE(sg_policy->freq_update_delay_ns);
-	if (rate_limit_ns <= 0)
-		rate_limit_ns = HOSTERR_DEFAULT_RATE_LIMIT_US * NSEC_PER_USEC;
-	if (sg_policy->is_oscillating)
-		rate_limit_ns *= 3;
-
-	delta_ns = time - sg_policy->last_freq_update_time;
-	return delta_ns >= rate_limit_ns;
+    /* Use smp_load_acquire to properly pair with smp_store_release
+     * in sugov_limits(). Ensures we see all policy limit updates
+     * before observing limits_changed = true.
+     */
+    if (unlikely(smp_load_acquire(&sg_policy->limits_changed))) {
+        /* smp_store_release ensures the write is visible after
+         * all prior reads of policy limits in this function.
+         */
+        smp_store_release(&sg_policy->limits_changed, false);
+        sg_policy->need_freq_update = true;
+        return true;
+    }
+    rate_limit_ns = READ_ONCE(sg_policy->freq_update_delay_ns);
+    if (rate_limit_ns <= 0)
+        rate_limit_ns = HOSTERR_DEFAULT_RATE_LIMIT_US * NSEC_PER_USEC;
+    if (sg_policy->is_oscillating)
+        rate_limit_ns *= 3;
+    delta_ns = time - sg_policy->last_freq_update_time;
+    return delta_ns >= rate_limit_ns;
 }
 
 static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
@@ -436,16 +559,20 @@ static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 	}
 	if (time - sg_policy->osc_window_start < (5ULL * NSEC_PER_SEC)) {
 		int current_dir = (next_freq > sg_policy->next_freq) ? 1 : -1;
-		if (sg_policy->last_dir != 0 && current_dir != sg_policy->last_dir)
-			sg_policy->osc_change_count++;
+        if (sg_policy->last_dir != 0 && current_dir != sg_policy->last_dir) {
+            unsigned int delta = abs((long)next_freq - (long)sg_policy->next_freq);
+            if (delta > OSC_MIN_DELTA(sg_policy))
+                sg_policy->osc_change_count++;
+        }
 		sg_policy->last_dir = current_dir;
-		if (sg_policy->osc_change_count > 3)
+		if (sg_policy->osc_change_count > 6)
 			sg_policy->is_oscillating = true;
 	} else {
 		sg_policy->osc_window_start = time;
 		sg_policy->osc_change_count = 0;
 		sg_policy->is_oscillating = false;
 		sg_policy->last_dir = 0;
+		sg_policy->calm_window_count = 0;
 	}
 
 	trace_android_rvh_set_sugov_update(sg_policy, next_freq, &should_update);
@@ -466,9 +593,70 @@ static void sugov_deferred_update(struct sugov_policy *sg_policy)
 	}
 }
 
+static unsigned int sugov_apply_smoothing(struct sugov_policy *sg_policy,
+					 unsigned int freq, unsigned int prev_raw)
+{
+	unsigned int w_prev, w_new, damping;
+	bool do_smooth = false;
+	bool is_prime = (arch_scale_cpu_capacity(sg_policy->policy->cpu) >= SCHED_CAPACITY_SCALE);
+	bool is_oscillating = sg_policy->is_oscillating;
+	if (is_prime) {
+		if (freq > prev_raw) {
+			w_prev = 7;
+			w_new  = 3;
+			do_smooth = true;
+		} else {
+			w_prev = 0;
+			w_new  = 10;
+			do_smooth = (freq < prev_raw) || is_oscillating;
+		}
+	} else {
+		w_prev = 7;
+		w_new  = 3;
+		do_smooth = (freq < prev_raw) || is_oscillating;
+	}
+	if (do_smooth) {
+		u64 acc = (u64)prev_raw * w_prev + (u64)freq * w_new;
+		freq = (unsigned int)(acc / 10);
+	}
+	if (freq > prev_raw) {
+		freq = prev_raw + ((freq - prev_raw) >> 1);
+	} else if (freq < prev_raw) {
+		damping = READ_ONCE(hosterr_cached.down_damping);
+		if (damping > 1) {
+			if (likely(damping == 4)) {
+				if (freq < (sg_policy->policy->cpuinfo.min_freq << 1))
+					freq = (prev_raw + (freq * 3)) >> 2;
+				else if (arch_scale_cpu_capacity(sg_policy->policy->cpu) >= (SCHED_CAPACITY_SCALE * 3 / 4))
+					freq = ((prev_raw * 2) + freq) / 3;
+				else
+					freq = ((prev_raw * 3) + freq) >> 2;
+			} else if (is_power_of_2(damping)) {
+				unsigned int shift = ilog2(damping);
+				freq = ((prev_raw * (damping - 1)) + freq) >> shift;
+			} else {
+				freq = ((prev_raw * (damping - 1)) + freq) / damping;
+			}
+		}
+		{
+			unsigned int drop = prev_raw - freq;
+			unsigned int max_drop = (prev_raw * 512) >> 10;
+			if (drop > max_drop)
+				freq = prev_raw - max_drop;
+		}
+		if (unlikely(is_oscillating)) {
+			unsigned int osc_limit = (prev_raw * 512) >> 10;
+			if (freq < osc_limit && freq > (sg_policy->policy->cpuinfo.min_freq << 1))
+				freq = osc_limit;
+		}
+	}
+	return freq;
+}
+
 /**
  * get_next_freq - Compute a new frequency for a given cpufreq policy.
  * @sg_policy: schedutil policy object to compute the new frequency for.
+ * @time: the update time from the caller
  * @util: Current CPU utilization.
  * @max: CPU capacity.
  *
@@ -476,102 +664,36 @@ static void sugov_deferred_update(struct sugov_policy *sg_policy)
  * Frame pressure adaptation, sleep/max overrides, predictive utilization
  * curves, and adaptive frequency smoothing filters.
  */
-static unsigned int get_next_freq(struct sugov_policy *sg_policy,
+static unsigned int get_next_freq(struct sugov_policy *sg_policy, u64 time,
 				  unsigned long util, unsigned long max)
 {
 	struct cpufreq_policy *policy = sg_policy->policy;
-	unsigned int freq;
-	unsigned int prev_raw = sg_policy->cached_raw_freq;
-	unsigned int damping;
-	bool is_sleep = (READ_ONCE(hosterr_sleep) == 1);
-	bool is_max   = (READ_ONCE(hosterr_max_mode) == 1);
-	unsigned long frame_boost;
-	unsigned int smooth_weight_prev;
-	unsigned int smooth_weight_new;
-	u64 frame_delay_ns;
-	u64 frame_budget_ns;
-	if (!policy)
+	unsigned int freq, prev_raw;
+	if (unlikely(!policy))
 		return 0;
-	frame_delay_ns  = READ_ONCE(hosterr_frame_delay_ns);
-	frame_budget_ns = READ_ONCE(hosterr_frame_budget_ns);
-	if (!frame_budget_ns)
-		frame_budget_ns = 16666666ULL;
-
-	hosterr_frame_pressure_update();
-
-	frame_boost = READ_ONCE(hosterr_frame_boost);
-	if (frame_boost) {
-		if (frame_boost >= (max - util))
-			util = max;
-		else
-			util += frame_boost;
-	}
-
-	if (frame_delay_ns > frame_budget_ns) {
-		unsigned long extra = max >> 4;
-		if (frame_delay_ns > (frame_budget_ns << 1))
-			extra = max >> 3;
-		if (util + extra >= max)
-			util = max;
-		else
-			util += extra;
-	}
-
-	if (unlikely(is_sleep)) {
+	if (unlikely(READ_ONCE(hosterr_cached.sleep))) {
+		policy->min = policy->cpuinfo.min_freq;
 		freq = policy->cpuinfo.min_freq;
-		goto resolve_freq;
+		goto resolve;
 	}
-
-	if (unlikely(is_max)) {
+	if (unlikely(READ_ONCE(hosterr_cached.max_mode))) {
 		freq = policy->cpuinfo.max_freq;
-		goto resolve_freq;
+		goto resolve;
 	}
+	if (policy->cpu == 7) {
+        policy->min = policy->cpuinfo.min_freq;
+    }
+	prev_raw = sg_policy->cached_raw_freq;
 	util = hosterr_predict_util(sg_policy, util, max);
 	util = hosterr_bend_utilization(util, max);
-	util = hosterr_dynamic_curve(policy, util, max);
+	util = hosterr_dynamic_curve(sg_policy, util, max);
 	util = map_util_perf(util);
 	freq = map_util_freq(util, policy->cpuinfo.max_freq, max);
-
-	if (policy->cpu == 7) {
-		if (freq > prev_raw) {
-			smooth_weight_prev = 9;
-			smooth_weight_new  = 1;
-		} else {
-			smooth_weight_prev = 0;
-			smooth_weight_new  = 10;
-		}
-	} else if (max < (SCHED_CAPACITY_SCALE * 3 / 4)) {
-		smooth_weight_prev = 7;
-		smooth_weight_new  = 3;
-	} else {
-		smooth_weight_prev = 3;
-		smooth_weight_new  = 7;
-	}
-
-	if (prev_raw != 0 && (sg_policy->is_oscillating || freq < prev_raw || (policy->cpu == 7 && freq > prev_raw))) {
-		freq = ((prev_raw * smooth_weight_prev) + (freq * smooth_weight_new));
-		freq = (freq * 205) >> 11;
-	}
-	if (prev_raw != 0 && freq > prev_raw && !is_max) {
-		freq = prev_raw + ((freq - prev_raw) >> 1);
-	}
-
-	damping = READ_ONCE(hosterr_down_damping);
-	if (damping > 1 && prev_raw != 0 && freq < prev_raw) {
-		if (damping == 4) {
-			freq = ((prev_raw * 3) + freq) >> 2;
-		} else {
-			freq = ((prev_raw * (damping - 1)) + freq) / damping;
-		}
-	}
-
-resolve_freq:
-	if (policy->min > policy->cpuinfo.min_freq)
-		policy->min = policy->cpuinfo.min_freq;
-
-	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
+	if (likely(prev_raw))
+		freq = sugov_apply_smoothing(sg_policy, freq, prev_raw);
+resolve:
+	if (freq == sg_policy->cached_raw_freq && likely(!sg_policy->need_freq_update))
 		return sg_policy->next_freq;
-
 	sg_policy->cached_raw_freq = freq;
 	return cpufreq_driver_resolve_freq(policy, freq);
 }
@@ -582,14 +704,9 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu)
 	unsigned long max = arch_scale_cpu_capacity(sg_cpu->cpu);
 	unsigned long util_cfs = cpu_util_cfs(rq);
 	unsigned long util;
-
 	sg_cpu->max = max;
 	sg_cpu->bw_dl = cpu_bw_dl(rq);
 	util = effective_cpu_util(sg_cpu->cpu, util_cfs, max, FREQUENCY_UTIL, NULL);
-	
-	if (util > util_cfs)
-		util = util_cfs;
-		
 	sg_cpu->util = util;
 }
 
@@ -643,7 +760,7 @@ static void sugov_update_single_freq(struct update_util_data *hook, u64 time,
 	if (!sugov_update_single_common(sg_cpu, time, flags))
 		return;
 
-	next_f = get_next_freq(sg_policy, sg_cpu->util, sg_cpu->max);
+	next_f = get_next_freq(sg_policy, time, sg_cpu->util, sg_cpu->max);
 	/*
 	 * Do not reduce the frequency if the CPU has not been idle
 	 * recently, as the reduction is likely to be premature then.
@@ -731,7 +848,7 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 		}
 	}
 
-	return get_next_freq(sg_policy, util, max);
+	return get_next_freq(sg_policy, time, util, max);
 }
 
 static void
@@ -1046,11 +1163,26 @@ static void sugov_exit(struct cpufreq_policy *policy)
 		sugov_clear_global_tunables();
 
 	mutex_unlock(&global_tunables_lock);
-
-	if (hosterr_bd) {
-		put_device(&hosterr_bd->dev);
-		hosterr_bd = NULL;
+	mutex_lock(&hosterr_init_lock);
+	if (--hosterr_policy_count == 0 && hosterr_works_init) {
+		if (hosterr_hp_state > 0) {
+            cpuhp_remove_state_nocalls(hosterr_hp_state);
+            hosterr_hp_state = 0;
+        }
+		atomic_set(&hosterr_timer_running, 0);
+		cancel_delayed_work_sync(&hosterr_background_work);
+		unregister_pm_notifier(&hosterr_pm_nb);
+		if (hosterr_bl_registered) {
+			backlight_unregister_notifier(&hosterr_bl_nb);
+			hosterr_bl_registered = false;
+		}
+		if (hosterr_bd) {
+			put_device(&hosterr_bd->dev);
+			hosterr_bd = NULL;
+		}
+		hosterr_works_init = false;
 	}
+	mutex_unlock(&hosterr_init_lock);
 	sugov_kthread_stop(sg_policy);
 	sugov_policy_free(sg_policy);
 	cpufreq_disable_fast_switch(policy);
@@ -1061,24 +1193,38 @@ static int sugov_start(struct cpufreq_policy *policy)
 	struct sugov_policy *sg_policy = policy->governor_data;
 	void (*uu)(struct update_util_data *data, u64 time, unsigned int flags);
 	unsigned int cpu;
-
-	if (unlikely(!hosterr_works_init)) {
+	unsigned long flags;
+	int hp_ret;
+	mutex_lock(&hosterr_init_lock);
+	if (!hosterr_works_init) {
 		INIT_DELAYED_WORK(&hosterr_background_work, hosterr_background_handler);
 		register_pm_notifier(&hosterr_pm_nb);
-		hosterr_works_init = true;
-
 		spin_lock_init(&hosterr_cache_lock);
+		spin_lock_irqsave(&hosterr_cache_lock, flags);
 		hosterr_cached.max_mode	  = hosterr_max_mode;
 		hosterr_cached.sleep		 = hosterr_sleep;
 		hosterr_cached.down_damping  = hosterr_down_damping;
+		hosterr_cached.bend_shift    = hosterr_bend_shift;
+		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
 
 		if (!hosterr_bd)
 			hosterr_bd = backlight_device_get_by_name("panel0-backlight");
 
-		hosterr_timer_running = true;
-		schedule_delayed_work(&hosterr_background_work, msecs_to_jiffies(500));
+		if (hosterr_bd) {
+			backlight_register_notifier(&hosterr_bl_nb);
+			hosterr_bl_registered = true;
+		}
+		hp_ret = cpuhp_setup_state_nocalls(CPUHP_BP_PREPARE_DYN, "cpufreq/hosterr:prepare",
+                                           hosterr_cpu_online_prep, NULL);
+        if (hp_ret >= 0)
+            hosterr_hp_state = hp_ret;
+		atomic_set(&hosterr_timer_running, 1);
+        queue_delayed_work(system_wq, &hosterr_background_work, msecs_to_jiffies(500));
+		hosterr_works_init = true;
 	}
 
+	hosterr_policy_count++;
+	mutex_unlock(&hosterr_init_lock);
 	sg_policy->freq_update_delay_ns  = sg_policy->tunables->rate_limit_us * NSEC_PER_USEC;
 	sg_policy->last_freq_update_time = 0;
 	sg_policy->next_freq			 = 0;
@@ -1086,8 +1232,21 @@ static int sugov_start(struct cpufreq_policy *policy)
 	sg_policy->limits_changed		= false;
 	sg_policy->cached_raw_freq	   = 0;
 	sg_policy->last_util			 = 0;
+	sg_policy->calm_window_count	 = 0;
 	sg_policy->need_freq_update	  = cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS);
+	{
+		unsigned long window = policy->max - policy->min;
 
+		if (!window || window < (policy->cpuinfo.max_freq >> 1)) {
+			sg_policy->dynamic_curve_scale = 0;
+		} else {
+			unsigned long scale = ((u64)policy->max << 10) / window;
+			unsigned long max_scale = (arch_scale_cpu_capacity(policy->cpu) >= (SCHED_CAPACITY_SCALE * 3 / 4)) ? 1024 : 2048;
+			if (scale > max_scale)
+				scale = max_scale;
+			sg_policy->dynamic_curve_scale = (unsigned int)scale;
+		}
+	}
 	for_each_cpu(cpu, policy->cpus) {
 		struct sugov_cpu *sg_cpu = &per_cpu(sugov_cpu, cpu);
 
@@ -1129,24 +1288,33 @@ static void sugov_stop(struct cpufreq_policy *policy)
 
 static void sugov_limits(struct cpufreq_policy *policy)
 {
-	struct sugov_policy *sg_policy = policy->governor_data;
+    struct sugov_policy *sg_policy = policy->governor_data;
+    unsigned long window;
 
-	if (!policy->fast_switch_enabled) {
-		mutex_lock(&sg_policy->work_lock);
-		cpufreq_policy_apply_limits(policy);
-		mutex_unlock(&sg_policy->work_lock);
-	}
-
-	/*
-	 * The limits_changed update below must take place before the updates
-	 * of policy limits in cpufreq_set_policy() or a policy limits update
-	 * might be missed, so use a memory barrier to ensure it.
-	 *
-	 * This pairs with the memory barrier in sugov_should_update_freq().
-	 */
-	smp_wmb();
-
-	WRITE_ONCE(sg_policy->limits_changed, true);
+    if (!policy->fast_switch_enabled) {
+        mutex_lock(&sg_policy->work_lock);
+        cpufreq_policy_apply_limits(policy);
+        mutex_unlock(&sg_policy->work_lock);
+    }
+    window = policy->max - policy->min;
+    if (!window || window < (policy->cpuinfo.max_freq >> 1)) {
+        sg_policy->dynamic_curve_scale = 0;
+    } else {
+        unsigned long scale = (policy->max << 10) / window;
+        unsigned long max_scale = (arch_scale_cpu_capacity(policy->cpu) >= (SCHED_CAPACITY_SCALE * 3 / 4)) ? 1024 : 2048;
+        if (scale > max_scale)
+            scale = max_scale;
+        sg_policy->dynamic_curve_scale = (unsigned int)scale;
+    }
+    /*
+     * The limits_changed update below must take place before the updates
+     * of policy limits in cpufreq_set_policy() or a policy limits update
+     * might be missed, so use a memory barrier to ensure it.
+     *
+     * This pairs with the memory barrier in sugov_should_update_freq().
+     */
+    smp_wmb();
+    WRITE_ONCE(sg_policy->limits_changed, true);
 }
 
 struct cpufreq_governor schedutil_gov = {
@@ -1168,3 +1336,6 @@ struct cpufreq_governor *cpufreq_default_governor(void)
 #endif
 
 cpufreq_governor_init(schedutil_gov);
+EXPORT_SYMBOL_GPL(hosterr_core_on);
+EXPORT_SYMBOL_GPL(hosterr_max_mode);
+EXPORT_SYMBOL_GPL(hosterr_max_mode_notifier_list);

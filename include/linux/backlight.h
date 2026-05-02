@@ -81,6 +81,10 @@ enum backlight_notification {
 	 * @BACKLIGHT_UNREGISTERED: The backlight revice is unregistered.
 	 */
 	BACKLIGHT_UNREGISTERED,
+	/**
+	 * @BACKLIGHT_UPDATED: The backlight device brightness was updated.
+	 */
+	BACKLIGHT_UPDATED,
 };
 
 /** enum backlight_scale - the type of scale used for brightness values
