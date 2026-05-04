@@ -325,9 +325,7 @@ static int hosterr_bl_notifier(struct notifier_block *nb,
         return NOTIFY_DONE;
     if (event == BACKLIGHT_UPDATED) {
         atomic_set(&hosterr_brightness_cached, bd->props.brightness);
-        if (bd->props.brightness > 0 && READ_ONCE(hosterr_sleep)) {
-            mod_delayed_work(system_wq, &hosterr_background_work, 0);
-        }
+        mod_delayed_work(system_wq, &hosterr_background_work, 0);
     }
     return NOTIFY_OK;
 }
@@ -340,7 +338,6 @@ static void hosterr_background_handler(struct work_struct *work)
     unsigned long flags;
     int brightness;
     int target_core7_state = -1;
-    unsigned int check_interval = 2000;
     struct backlight_device *bd_local;
     bd_local = smp_load_acquire(&hosterr_bd);
     if (!bd_local) {
@@ -363,7 +360,7 @@ static void hosterr_background_handler(struct work_struct *work)
         brightness = atomic_read(&hosterr_brightness_cached);
     }
     if (brightness < 0)
-        goto reschedule;
+        return;
     spin_lock_irqsave(&hosterr_cache_lock, flags);
     if (brightness == 0 && hosterr_cached.sleep == 0) {
         hosterr_zero_brightness_count++;
@@ -376,6 +373,10 @@ static void hosterr_background_handler(struct work_struct *work)
                 hosterr_max_mode_saved = true;
                 update_hosterr_max_mode(0);
                 hosterr_cached.max_mode = 0;
+            }
+        } else {
+            if (atomic_read(&hosterr_timer_running)) {
+                schedule_delayed_work(&hosterr_background_work, msecs_to_jiffies(2000));
             }
         }
     } else if (brightness > 0 && (hosterr_cached.sleep == 1 || !READ_ONCE(hosterr_core_on[7]))) {
@@ -394,12 +395,6 @@ static void hosterr_background_handler(struct work_struct *work)
     spin_unlock_irqrestore(&hosterr_cache_lock, flags);
     if (target_core7_state != -1)
         hosterr_core_control(7, HOSTERR_REQ_SYSTEM, !!target_core7_state);
-
-reschedule:
-    if (atomic_read(&hosterr_timer_running)) {
-        schedule_delayed_work(&hosterr_background_work,
-                              msecs_to_jiffies(check_interval));
-    }
 }
 
 static int hosterr_pm_callback(struct notifier_block *nb, unsigned long action,
