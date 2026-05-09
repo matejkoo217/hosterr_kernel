@@ -172,6 +172,7 @@ enum {
 	Opt_nogc_merge,
 	Opt_discard_unit,
 	Opt_memory_mode,
+	Opt_age_extent_cache,
 	Opt_lookup_mode,
 	Opt_err,
 };
@@ -252,6 +253,7 @@ static match_table_t f2fs_tokens = {
 	{Opt_nogc_merge, "nogc_merge"},
 	{Opt_discard_unit, "discard_unit=%s"},
 	{Opt_memory_mode, "memory=%s"},
+	{Opt_age_extent_cache, "age_extent_cache"},
 	{Opt_lookup_mode, "lookup_mode=%s"},
 	{Opt_err, NULL},
 };
@@ -1324,14 +1326,19 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 			if (!strcmp(name, "normal")) {
 				F2FS_OPTION(sbi).memory_mode =
 						MEMORY_MODE_NORMAL;
+				clear_opt(sbi, LOW_MEMORY);
 			} else if (!strcmp(name, "low")) {
 				F2FS_OPTION(sbi).memory_mode =
 						MEMORY_MODE_LOW;
+				set_opt(sbi, LOW_MEMORY);
 			} else {
 				kfree(name);
 				return -EINVAL;
 			}
 			kfree(name);
+			break;
+		case Opt_age_extent_cache:
+			set_opt(sbi, AGE_EXTENT_CACHE);
 			break;
 
 		case Opt_lookup_mode:
@@ -2121,6 +2128,9 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 	if (test_opt(sbi, ATGC))
 		seq_puts(seq, ",atgc");
 
+	if (test_opt(sbi, AGE_EXTENT_CACHE))
+		seq_puts(seq, ",age_extent_cache");
+
 	if (F2FS_OPTION(sbi).discard_unit == DISCARD_UNIT_BLOCK)
 		seq_printf(seq, ",discard_unit=%s", "block");
 	else if (F2FS_OPTION(sbi).discard_unit == DISCARD_UNIT_SEGMENT)
@@ -2168,6 +2178,8 @@ static void default_options(struct f2fs_sb_info *sbi)
 	F2FS_OPTION(sbi).compress_mode = COMPR_MODE_FS;
 	F2FS_OPTION(sbi).bggc_mode = BGGC_MODE_ON;
 	F2FS_OPTION(sbi).memory_mode = MEMORY_MODE_NORMAL;
+	clear_opt(sbi, LOW_MEMORY);
+	clear_opt(sbi, AGE_EXTENT_CACHE);
 
 	set_opt(sbi, ATGC);
 	set_opt(sbi, GC_MERGE);

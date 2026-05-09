@@ -86,10 +86,17 @@ bool f2fs_available_free_memory(struct f2fs_sb_info *sbi, int type)
 		mem_size >>= PAGE_SHIFT;
 		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) >> 1);
 	} else if (type == EXTENT_CACHE) {
-		mem_size = (atomic_read(&sbi->total_ext_tree) *
-				sizeof(struct extent_tree) +
-				atomic_read(&sbi->total_ext_node) *
-				sizeof(struct extent_node)) >> PAGE_SHIFT;
+		int i;
+
+		for (i = 0; i < NR_EXTENT_CACHES; i++) {
+			mem_size += (unsigned long)atomic_read(&sbi->total_ext_tree[i]) *
+							sizeof(struct extent_tree);
+			mem_size += (unsigned long)atomic_read(&sbi->total_ext_node[i]) *
+							sizeof(struct extent_node);
+		}
+		mem_size += (unsigned long)atomic_read(&sbi->total_zombie_tree) *
+						sizeof(struct extent_tree);
+		mem_size >>= PAGE_SHIFT;
 		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) >> 1);
 	} else if (type == DISCARD_CACHE) {
 		mem_size = (atomic_read(&dcc->discard_cmd_cnt) *
@@ -872,7 +879,7 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 		f2fs_update_extent_tree_range_compressed(dn->inode,
 					index, blkaddr,
 					F2FS_I(dn->inode)->i_cluster_size,
-					c_len);
+					c_len, EX_READ);
 	}
 out:
 	return 0;
@@ -3241,8 +3248,13 @@ static int init_node_manager(struct f2fs_sb_info *sbi)
 						F2FS_RESERVED_NODE_NUM;
 	nm_i->nid_cnt[FREE_NID] = 0;
 	nm_i->nid_cnt[PREALLOC_NID] = 0;
-	nm_i->ram_thresh = DEF_RAM_THRESHOLD;
-	nm_i->ra_nid_pages = DEF_RA_NID_PAGES;
+	if (f2fs_low_mem_mode(sbi)) {
+		nm_i->ram_thresh = DEF_RAM_THRESHOLD / 2;
+		nm_i->ra_nid_pages = DEF_RA_NID_PAGES / 2;
+	} else {
+		nm_i->ram_thresh = DEF_RAM_THRESHOLD;
+		nm_i->ra_nid_pages = DEF_RA_NID_PAGES;
+	}
 	nm_i->dirty_nats_ratio = DEF_DIRTY_NAT_RATIO_THRESHOLD;
 	nm_i->max_rf_node_blocks = DEF_RF_NODE_BLOCKS;
 
