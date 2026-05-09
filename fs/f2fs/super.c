@@ -2277,7 +2277,6 @@ restore_flag:
 
 static void f2fs_enable_checkpoint(struct f2fs_sb_info *sbi)
 {
-	int retry = DEFAULT_RETRY_IO_COUNT;
 	unsigned int nr_pages = get_pages(sbi, F2FS_DIRTY_DATA) / 16;
 	long long start, writeback, lock, sync_inode, end;
 	int ret;
@@ -2347,7 +2346,7 @@ static void f2fs_enable_checkpoint(struct f2fs_sb_info *sbi)
 				ktime_ms_delta(lock, writeback),
 				ktime_ms_delta(sync_inode, lock),
 				ktime_ms_delta(end, sync_inode));
-	return ret;
+	return;
 }
 
 static int f2fs_remount(struct super_block *sb, int *flags, char *data)
