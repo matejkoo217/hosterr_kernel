@@ -54,7 +54,7 @@ int tcp_orphan_count_sum(void);
 void tcp_time_wait(struct sock *sk, int state, int timeo);
 
 #define MAX_TCP_HEADER	L1_CACHE_ALIGN(128 + MAX_HEADER)
-#define MAX_TCP_OPTION_SPACE 40
+#define MAX_TCP_OPTION_SPACE 40f
 #define TCP_MIN_SND_MSS		48
 #define TCP_MIN_GSO_SIZE	(TCP_MIN_SND_MSS - MAX_TCP_OPTION_SPACE)
 
@@ -805,6 +805,11 @@ static inline u32 tcp_stamp_us_delta(u64 t1, u64 t0)
 	return max_t(s64, t1 - t0, 0);
 }
 
+static inline u32 tcp_stamp32_us_delta(u32 t1, u32 t0)
+{
+	return max_t(s32, t1 - t0, 0);
+}
+
 static inline u32 tcp_skb_timestamp(const struct sk_buff *skb)
 {
 	return tcp_ns_to_ts(skb->skb_mstamp_ns);
@@ -836,6 +841,11 @@ static inline u64 tcp_skb_timestamp_us(const struct sk_buff *skb)
  * This is 44 bytes if IPV6 is enabled.
  * If this grows please adjust skbuff.h:skbuff->cb[xxx] size appropriately.
  */
+#define TCPCB_IN_FLIGHT_BITS 20
+#define TCPCB_IN_FLIGHT_MAX ((1U << TCPCB_IN_FLIGHT_BITS) - 1)
+#define TCPCB_DELIVERED_CE_BITS 12
+#define TCPCB_DELIVERED_CE_MASK ((1U << TCPCB_DELIVERED_CE_BITS) - 1)
+
 struct tcp_skb_cb {
 	__u32		seq;		/* Starting sequence number	*/
 	__u32		end_seq;	/* SEQ + FIN + SYN + datalen	*/
@@ -873,15 +883,17 @@ struct tcp_skb_cb {
 	union {
 		struct {
 			/* There is space for up to 24 bytes */
-			__u32 in_flight:30,/* Bytes in flight at transmit */
+			__u32 in_flight:TCPCB_IN_FLIGHT_BITS,/* Bytes in flight at transmit */
 			      is_app_limited:1, /* cwnd not fully used? */
-			      unused:1;
+			      unused:11;
 			/* pkts S/ACKed so far upon tx of skb, incl retrans: */
 			__u32 delivered;
+			__u32 delivered_ce:TCPCB_DELIVERED_CE_BITS;
 			/* start of send pipeline phase */
-			u64 first_tx_mstamp;
+			u32 first_tx_mstamp;
 			/* when we reached the "delivered" count */
-			u64 delivered_mstamp;
+			u32 delivered_mstamp;
+			u32 lost;
 		} tx;   /* only used for outgoing skbs */
 		union {
 			struct inet_skb_parm	h4;
@@ -1026,11 +1038,16 @@ struct ack_sample {
  */
 struct rate_sample {
 	u64  prior_mstamp; /* starting timestamp for interval */
-	u32  prior_delivered;	/* tp->delivered at "prior_mstamp" */
-	s32  delivered;		/* number of packets delivered over interval */
-	long interval_us;	/* time for tp->delivered to incr "delivered" */
-	u32 snd_interval_us;	/* snd interval for delivered packets */
-	u32 rcv_interval_us;	/* rcv interval for delivered packets */
+	u32  prior_lost;	/* tp->lost at "prior_mstamp" */
+	u32  prior_delivered;   /* tp->delivered at "prior_mstamp" */
+	u32  prior_delivered_ce;/* tp->delivered_ce at "prior_mstamp" */
+	u32  tx_in_flight;	/* packets in flight at starting timestamp */
+	s32  lost;              /* number of packets lost over interval */
+	s32  delivered;         /* number of packets delivered over interval */
+	s32  delivered_ce;      /* number of packets delivered w/ CE marks*/
+	long interval_us;       /* time for tp->delivered to incr "delivered" */
+	u32 snd_interval_us;    /* snd interval for delivered packets */
+	u32 rcv_interval_us;    /* rcv interval for delivered packets */
 	long rtt_us;		/* RTT of last (S)ACKed packet (or -1) */
 	int  losses;		/* number of packets marked lost upon ACK */
 	u32  acked_sacked;	/* number of packets newly (S)ACKed upon ACK */
