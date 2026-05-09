@@ -104,6 +104,19 @@ extern const char *f2fs_fault_name[FAULT_MAX];
 #define	F2FS_MOUNT_GC_MERGE		0x20000000
 #define F2FS_MOUNT_COMPRESS_CACHE	0x40000000
 #define F2FS_MOUNT_RESERVE_NODE		0x80000000
+#define F2FS_MOUNT_LOW_MEMORY		0x0000000100000000ULL
+#define F2FS_MOUNT_AGE_EXTENT_CACHE	0x0000000200000000ULL
+
+enum {
+	MEMORY_MODE_NORMAL,	/* default memory mode */
+	MEMORY_MODE_LOW,	/* low memory mode for low-ram devices */
+};
+
+enum extent_type {
+	EX_READ = 0,
+	EX_BLOCK_AGE,
+	NR_EXTENT_CACHES,
+};
 
 #define F2FS_OPTION(sbi)	((sbi)->mount_opt)
 #define clear_opt(sbi, option)	(F2FS_OPTION(sbi).opt &= ~F2FS_MOUNT_##option)
@@ -144,7 +157,7 @@ struct f2fs_mount_info {
 	kuid_t s_resuid;		/* reserved blocks for uid */
 	kgid_t s_resgid;		/* reserved blocks for gid */
 	int active_logs;		/* # of active logs */
-	int inline_xattr_size;		/* inline xattr size */
+	int inline_xattr_size;	/* inline xattr size */
 #ifdef CONFIG_F2FS_FAULT_INJECTION
 	struct f2fs_fault_info fault_info;	/* For fault injection */
 #endif
@@ -633,6 +646,7 @@ struct extent_node {
 
 struct extent_tree {
 	nid_t ino;			/* inode number */
+	enum extent_type type;		/* cache type */
 	struct rb_root_cached root;	/* root of extent info rb-tree */
 	struct extent_node *cached_en;	/* recently accessed extent node */
 	struct extent_info largest;	/* largested extent info */
@@ -640,7 +654,18 @@ struct extent_tree {
 	rwlock_t lock;			/* protect extent info rb-tree */
 	atomic_t node_cnt;		/* # of extent node in rb-tree*/
 	bool largest_updated;		/* largest extent updated */
+	struct inode *inode;		/* lookup inode */
 };
+
+static inline void f2fs_set_et_type(struct extent_tree *et, enum extent_type type)
+{
+	et->type = type;
+}
+
+static inline enum extent_type f2fs_get_et_type(struct extent_tree *et)
+{
+	return et->type;
+}
 
 /*
  * This structure is taken from ext4_map_blocks.
@@ -803,7 +828,7 @@ struct f2fs_inode_info {
 	struct list_head dirty_list;	/* dirty list for dirs and files */
 	struct list_head gdirty_list;	/* linked in global dirty list */
 	struct task_struct *atomic_write_task;	/* store atomic write task */
-	struct extent_tree *extent_tree;	/* cached extent_tree entry */
+	struct extent_tree *extent_tree[NR_EXTENT_CACHES];	/* cached extent_tree entry */
 	union {
 		struct inode *cow_inode;	/* copy-on-write inode for atomic write */
 		struct inode *atomic_inode;
@@ -1375,10 +1400,8 @@ enum {
 	DISCARD_UNIT_SECTION,	/* basic discard unit is section */
 };
 
-enum {
-	MEMORY_MODE_NORMAL,	/* memory mode for normal devices */
-	MEMORY_MODE_LOW,	/* memory mode for low memry devices */
-};
+
+
 
 
 
@@ -1669,14 +1692,14 @@ struct f2fs_sb_info {
 	struct mutex flush_lock;		/* for flush exclusion */
 
 	/* for extent tree cache */
-	struct radix_tree_root extent_tree_root;/* cache extent cache entries */
-	struct mutex extent_tree_lock;	/* locking extent radix tree */
-	struct list_head extent_list;		/* lru list for shrinker */
-	spinlock_t extent_lock;			/* locking extent lru list */
-	atomic_t total_ext_tree;		/* extent tree count */
-	struct list_head zombie_list;		/* extent zombie tree list */
+	struct radix_tree_root extent_tree_root[NR_EXTENT_CACHES];/* cache extent cache entries */
+	struct mutex extent_tree_lock[NR_EXTENT_CACHES];	/* locking extent radix tree */
+	struct list_head extent_list[NR_EXTENT_CACHES];		/* lru list for shrinker */
+	spinlock_t extent_lock[NR_EXTENT_CACHES];			/* locking extent lru list */
+	atomic_t total_ext_tree[NR_EXTENT_CACHES];		/* extent tree count */
+	struct list_head zombie_list[NR_EXTENT_CACHES];		/* extent zombie tree list */
 	atomic_t total_zombie_tree;		/* extent zombie tree count */
-	atomic_t total_ext_node;		/* extent info count */
+	atomic_t total_ext_node[NR_EXTENT_CACHES];		/* extent info count */
 
 	/* basic filesystem units */
 	unsigned int log_sectors_per_block;	/* log2 sectors per block */
@@ -4167,7 +4190,7 @@ bool f2fs_check_rb_tree_consistence(struct f2fs_sb_info *sbi,
 unsigned int f2fs_shrink_extent_tree(struct f2fs_sb_info *sbi, int nr_shrink);
 void f2fs_init_extent_tree(struct inode *inode, struct page *ipage);
 void f2fs_drop_extent_tree(struct inode *inode);
-unsigned int f2fs_destroy_extent_node(struct inode *inode);
+void f2fs_destroy_extent_node(struct inode *inode);
 void f2fs_destroy_extent_tree(struct inode *inode);
 bool f2fs_lookup_extent_cache(struct inode *inode, pgoff_t pgofs,
 			struct extent_info *ei);
@@ -4259,7 +4282,7 @@ int f2fs_write_multi_pages(struct compress_ctx *cc,
 int f2fs_is_compressed_cluster(struct inode *inode, pgoff_t index);
 void f2fs_update_extent_tree_range_compressed(struct inode *inode,
 				pgoff_t fofs, block_t blkaddr, unsigned int llen,
-				unsigned int c_len);
+				unsigned int c_len, enum extent_type type);
 int f2fs_read_multi_pages(struct compress_ctx *cc, struct bio **bio_ret,
 				unsigned nr_pages, sector_t *last_block_in_bio,
 				bool is_readahead, bool for_write);
@@ -4342,7 +4365,7 @@ static inline void f2fs_invalidate_compress_pages(struct f2fs_sb_info *sbi,
 #define inc_compr_inode_stat(inode)		do { } while (0)
 static inline void f2fs_update_extent_tree_range_compressed(struct inode *inode,
 				pgoff_t fofs, block_t blkaddr, unsigned int llen,
-				unsigned int c_len) { }
+				unsigned int c_len, enum extent_type type) { }
 #endif
 
 static inline int set_compress_context(struct inode *inode)

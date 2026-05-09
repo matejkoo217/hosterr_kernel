@@ -849,9 +849,30 @@ skip:
 struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
 				struct vm_fault *vmf)
 {
+	struct vm_area_struct *vma = vmf->vma;
+
+	/*
+	 * Skip readahead for small VMAs. Small VMAs usually don't have
+	 * enough spatial locality to benefit from readahead.
+	 */
+	if (vma && vma_pages(vma) <= 1)
+		goto skip;
+
+	/*
+	 * Skip readahead for unshared swap entries. If a swap entry
+	 * has only one user, checking neighbors in the VMA is often
+	 * a waste of time.
+	 */
+	if (swp_swap_info(entry)->flags & SWP_SYNCHRONOUS_IO) {
+		if (__swap_count(entry) == 1)
+			goto skip;
+	}
+
 	return swap_use_vma_readahead() ?
 			swap_vma_readahead(entry, gfp_mask, vmf) :
 			swap_cluster_readahead(entry, gfp_mask, vmf);
+skip:
+	return read_swap_cache_async(entry, gfp_mask, vma, vmf->address, true);
 }
 
 #ifdef CONFIG_SYSFS
