@@ -34,9 +34,11 @@
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
-
+#include <trace/hooks/vmscan.h>
 #include "zram_drv.h"
 
+extern struct atomic_notifier_head hosterr_sleep_notifier_list;
+static bool is_sleeping;
 static DEFINE_IDR(zram_index_idr);
 /* idr index must be protected */
 static DEFINE_MUTEX(zram_index_mutex);
@@ -44,6 +46,9 @@ static DEFINE_MUTEX(zram_index_mutex);
 static int zram_major;
 static const char *default_compressor = "lz4kd";
 
+static unsigned int auto_recomp_delay = 120; /* 2 minutes */
+module_param(auto_recomp_delay, uint, 0644);
+MODULE_PARM_DESC(auto_recomp_delay, "Idle delay in seconds before auto-recompression");
 /* Module params (documentation at end) */
 static unsigned int num_devices = 1;
 /*
@@ -888,13 +893,18 @@ static void zram_debugfs_destroy(void)
 {
 	debugfs_remove_recursive(zram_debugfs_root);
 }
+#endif
 
 static void zram_accessed(struct zram *zram, u32 index)
 {
 	zram_clear_flag(zram, index, ZRAM_IDLE);
+	zram->table[index].last_access = ktime_get_boottime_seconds();
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	zram->table[index].ac_time = ktime_get_boottime();
+#endif
 }
 
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
 static ssize_t read_block_state(struct file *file, char __user *buf,
 				size_t count, loff_t *ppos)
 {
@@ -1828,6 +1838,80 @@ release_init_lock:
 	up_read(&zram->init_lock);
 	return ret;
 }
+
+static void zram_auto_recomp_work(struct work_struct *work)
+{
+	struct zram *zram = container_of(work, struct zram, auto_recomp_work);
+	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+	unsigned long index;
+	struct page *page;
+	unsigned int now = ktime_get_boottime_seconds();
+	if (auto_recomp_delay == 0)
+		return;
+	page = alloc_page(GFP_KERNEL);
+	if (!page)
+		return;
+	down_read(&zram->init_lock);
+	if (!init_done(zram))
+		goto out;
+	for (index = 0; index < nr_pages; index++) {
+		zram_slot_lock(zram, index);
+		if (!zram_allocated(zram, index))
+			goto next;
+		if (zram_test_flag(zram, index, ZRAM_WB) ||
+		    zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
+		    zram_test_flag(zram, index, ZRAM_SAME) ||
+		    zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE) ||
+		    zram_get_priority(zram, index) >= ZRAM_SECONDARY_COMP)
+			goto next;
+		if (now - zram->table[index].last_access < auto_recomp_delay)
+			goto next;
+		zram_recompress(zram, index, page, 0, ZRAM_SECONDARY_COMP, ZRAM_MAX_COMPS);
+next:
+		zram_slot_unlock(zram, index);
+		cond_resched();
+	}
+out:
+	up_read(&zram->init_lock);
+	__free_page(page);
+}
+
+static void zram_kswapd_done_hook(void *unused, int node_id,
+				 unsigned int highest_zoneidx,
+				 unsigned int alloc_order,
+				 unsigned int reclaim_order)
+{
+	struct zram *zram;
+	int dev_id;
+	if (reclaim_order < alloc_order || READ_ONCE(is_sleeping))
+		return;
+	mutex_lock(&zram_index_mutex);
+	idr_for_each_entry(&zram_index_idr, zram, dev_id) {
+		schedule_work(&zram->auto_recomp_work);
+	}
+	mutex_unlock(&zram_index_mutex);
+}
+
+static int zram_sleep_notifier(struct notifier_block *nb,
+			      unsigned long action, void *data)
+{
+	struct zram *zram;
+	int dev_id;
+	if (action == 1) {
+		WRITE_ONCE(is_sleeping, true);
+		mutex_lock(&zram_index_mutex);
+		idr_for_each_entry(&zram_index_idr, zram, dev_id) {
+			schedule_work(&zram->auto_recomp_work);
+		}
+		mutex_unlock(&zram_index_mutex);
+	} else if (action == 0) {
+		WRITE_ONCE(is_sleeping, false);
+	}
+	return NOTIFY_OK;
+}
+static struct notifier_block zram_sleep_nb = {
+	.notifier_call = zram_sleep_notifier,
+};
 #endif
 
 /*
@@ -2307,6 +2391,9 @@ static int zram_add(void)
 	device_id = ret;
 
 	init_rwsem(&zram->init_lock);
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	INIT_WORK(&zram->auto_recomp_work, zram_auto_recomp_work);
+#endif
 #ifdef CONFIG_ZRAM_WRITEBACK
 	spin_lock_init(&zram->wb_limit_lock);
 #endif
@@ -2379,6 +2466,10 @@ out_free_dev:
 static int zram_remove(struct zram *zram)
 {
 	struct block_device *bdev = zram->disk->part0;
+
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	cancel_work_sync(&zram->auto_recomp_work);
+#endif
 
 	mutex_lock(&bdev->bd_disk->open_mutex);
 	if (bdev->bd_openers || zram->claim) {
@@ -2481,6 +2572,10 @@ static int zram_remove_cb(int id, void *ptr, void *data)
 
 static void destroy_devices(void)
 {
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	atomic_notifier_chain_unregister(&hosterr_sleep_notifier_list, &zram_sleep_nb);
+	unregister_trace_android_vh_vmscan_kswapd_done(zram_kswapd_done_hook, NULL);
+#endif
 	class_unregister(&zram_control_class);
 	idr_for_each(&zram_index_idr, &zram_remove_cb, NULL);
 	zram_debugfs_destroy();
@@ -2507,6 +2602,10 @@ static int __init zram_init(void)
 	}
 
 	zram_debugfs_create();
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	register_trace_android_vh_vmscan_kswapd_done(zram_kswapd_done_hook, NULL);
+	atomic_notifier_chain_register(&hosterr_sleep_notifier_list, &zram_sleep_nb);
+#endif
 	zram_major = register_blkdev(0, "zram");
 	if (zram_major <= 0) {
 		pr_err("Unable to get major number\n");

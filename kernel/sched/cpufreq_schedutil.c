@@ -40,6 +40,7 @@ struct hosterr_cache {
 unsigned int hosterr_max_mode	  = 0;
 
 ATOMIC_NOTIFIER_HEAD(hosterr_max_mode_notifier_list);
+ATOMIC_NOTIFIER_HEAD(hosterr_sleep_notifier_list);
 
 static void update_hosterr_max_mode(unsigned int val)
 {
@@ -50,6 +51,11 @@ static void update_hosterr_max_mode(unsigned int val)
 }
 
 unsigned int hosterr_sleep		 = 0;
+static void update_hosterr_sleep(unsigned int val)
+{
+	atomic_notifier_call_chain(&hosterr_sleep_notifier_list, val, NULL);
+}
+static void hosterr_recalc_curve_scale(struct sugov_policy *sg_policy);
 static unsigned int hosterr_down_damping  = 4;
 static unsigned int hosterr_bend_shift	 = 3;
 #define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
@@ -196,6 +202,8 @@ static int hosterr_##name##_sync_set(const char *val, const struct kernel_param 
 		hosterr_cached.name = var; \
 		if (!strcmp(#name, "max_mode")) \
 			update_hosterr_max_mode(var); \
+		else if (!strcmp(#name, "sleep")) \
+			update_hosterr_sleep(var); \
 		spin_unlock_irqrestore(&hosterr_cache_lock, flags); \
 	} \
 	return ret; \
@@ -368,6 +376,7 @@ static void hosterr_background_handler(struct work_struct *work)
             hosterr_zero_brightness_count = 0;
             WRITE_ONCE(hosterr_sleep, 1);
             hosterr_cached.sleep = 1;
+            update_hosterr_sleep(1);
             target_core7_state = 0;
             if (hosterr_cached.max_mode == 1) {
                 hosterr_max_mode_saved = true;
@@ -383,6 +392,7 @@ static void hosterr_background_handler(struct work_struct *work)
         hosterr_zero_brightness_count = 0;
         WRITE_ONCE(hosterr_sleep, 0);
         hosterr_cached.sleep = 0;
+        update_hosterr_sleep(0);
         target_core7_state = 1;
         if (hosterr_max_mode_saved) {
             update_hosterr_max_mode(1);
@@ -406,6 +416,7 @@ static int hosterr_pm_callback(struct notifier_block *nb, unsigned long action,
         spin_lock_irqsave(&hosterr_cache_lock, flags);
         WRITE_ONCE(hosterr_sleep, 1);
         hosterr_cached.sleep = 1;
+        update_hosterr_sleep(1);
         if (hosterr_cached.max_mode == 1) {
             hosterr_max_mode_saved = true;
             update_hosterr_max_mode(0);
@@ -427,6 +438,7 @@ static int hosterr_pm_callback(struct notifier_block *nb, unsigned long action,
         }
         WRITE_ONCE(hosterr_sleep, 0);
         hosterr_cached.sleep = 0;
+        update_hosterr_sleep(0);
         hosterr_zero_brightness_count = 0;
         spin_unlock_irqrestore(&hosterr_cache_lock, flags);
         hosterr_core_control(7, HOSTERR_REQ_SYSTEM, true);
@@ -1334,3 +1346,5 @@ cpufreq_governor_init(schedutil_gov);
 EXPORT_SYMBOL_GPL(hosterr_core_on);
 EXPORT_SYMBOL_GPL(hosterr_max_mode);
 EXPORT_SYMBOL_GPL(hosterr_max_mode_notifier_list);
+EXPORT_SYMBOL_GPL(hosterr_sleep);
+EXPORT_SYMBOL_GPL(hosterr_sleep_notifier_list);

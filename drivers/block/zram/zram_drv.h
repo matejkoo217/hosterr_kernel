@@ -66,6 +66,7 @@ struct zram_table_entry {
 		unsigned long element;
 	};
 	unsigned long flags;
+	unsigned int last_access;
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	ktime_t ac_time;
 #endif
@@ -131,6 +132,9 @@ struct zram {
 	 * zram is claimed so open request will be failed
 	 */
 	bool claim; /* Protected by disk->open_mutex */
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	struct work_struct auto_recomp_work;
+#endif
 #ifdef CONFIG_ZRAM_WRITEBACK
 	struct file *backing_dev;
 	spinlock_t wb_limit_lock;
