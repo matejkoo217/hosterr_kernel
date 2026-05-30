@@ -7,6 +7,7 @@
  * Copyright(C) 2007, Red Hat, Inc., Ingo Molnar
  */
 #include "sched.h"
+#include <linux/proc_fs.h>
 
 /*
  * This allows printing both to /proc/sched_debug and
@@ -297,6 +298,13 @@ static const struct file_operations sched_debug_fops = {
 	.release	= seq_release,
 };
 
+static const struct proc_ops sched_debug_proc_ops = {
+	.proc_open	= sched_debug_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= seq_release,
+};
+
 static struct dentry *debugfs_sched;
 
 static __init int sched_init_debug(void)
@@ -338,6 +346,8 @@ static __init int sched_init_debug(void)
 #endif
 
 	debugfs_create_file("debug", 0444, debugfs_sched, NULL, &sched_debug_fops);
+
+	proc_create("sched_debug", 0444, NULL, &sched_debug_proc_ops);
 
 	return 0;
 }
@@ -542,6 +552,9 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
 		SPLIT_NS(p->se.sum_exec_runtime),
 		SPLIT_NS(schedstat_val_or_zero(p->se.statistics.sum_sleep_runtime)));
 
+#ifdef CONFIG_SCHED_BORE
+	SEQ_printf(m, " %2d", p->se.burst_score);
+#endif // CONFIG_SCHED_BORE
 #ifdef CONFIG_NUMA_BALANCING
 	SEQ_printf(m, " %d %d", task_node(p), task_numa_group_id(p));
 #endif
@@ -559,9 +572,17 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 	SEQ_printf(m, "\n");
 	SEQ_printf(m, "runnable tasks:\n");
 	SEQ_printf(m, " S            task   PID         tree-key  switches  prio"
-		   "     wait-time             sum-exec        sum-sleep\n");
+	           "     wait-time             sum-exec        sum-sleep"
+	#ifdef CONFIG_SCHED_BORE
+	           "  bore"
+	#endif
+	           "\n");
 	SEQ_printf(m, "-------------------------------------------------------"
-		   "------------------------------------------------------\n");
+	           "------------------------------------------------------"
+	#ifdef CONFIG_SCHED_BORE
+	           "------"
+	#endif
+	           "\n");
 
 	rcu_read_lock();
 	for_each_process_thread(g, p) {
