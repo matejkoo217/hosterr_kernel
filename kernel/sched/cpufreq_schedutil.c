@@ -22,6 +22,8 @@
 #include <linux/suspend.h>
 #include <linux/topology.h>
 #include <linux/backlight.h>
+#include <linux/input.h>
+#include <trace/hooks/evdev.h>
 #ifndef SCHED_CPUFREQ_IOWAIT
 #define SCHED_CPUFREQ_IOWAIT	0x1
 #endif
@@ -55,12 +57,12 @@ static void update_hosterr_sleep(unsigned int val)
 {
 	atomic_notifier_call_chain(&hosterr_sleep_notifier_list, val, NULL);
 }
-static void hosterr_recalc_curve_scale(struct sugov_policy *sg_policy);
 static unsigned int hosterr_down_damping  = 4;
 static unsigned int hosterr_bend_shift	 = 3;
 #define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
 static struct backlight_device *hosterr_bd = NULL;
 static bool hosterr_max_mode_saved = false;
+static atomic_t hosterr_power_wake_count = ATOMIC_INIT(0);
 static struct hosterr_cache hosterr_cached;
 static DEFINE_SPINLOCK(hosterr_cache_lock);
 static struct delayed_work hosterr_background_work;
@@ -341,13 +343,33 @@ static struct notifier_block hosterr_bl_nb = {
 	.notifier_call = hosterr_bl_notifier,
 };
 
+static void hosterr_input_event_handler(void *unused, int head, int tail, int bufsize, int type, int code, int value)
+{
+	if (type == EV_KEY && code == KEY_POWER) {
+		if (READ_ONCE(hosterr_sleep) == 1) {
+			atomic_inc(&hosterr_power_wake_count);
+			mod_delayed_work(system_wq, &hosterr_background_work, 0);
+		}
+	}
+}
+
 static void hosterr_background_handler(struct work_struct *work)
 {
     unsigned long flags;
     int brightness;
     int target_core7_state = -1;
+    bool power_wake;
     struct backlight_device *bd_local;
+
+    if (atomic_read(&hosterr_power_wake_count) >= 2) {
+        atomic_set(&hosterr_power_wake_count, 0);
+        power_wake = true;
+    } else {
+        power_wake = false;
+    }
+
     bd_local = smp_load_acquire(&hosterr_bd);
+
     if (!bd_local) {
         mutex_lock(&hosterr_init_lock);
         bd_local = hosterr_bd;
@@ -388,8 +410,9 @@ static void hosterr_background_handler(struct work_struct *work)
                 schedule_delayed_work(&hosterr_background_work, msecs_to_jiffies(2000));
             }
         }
-    } else if (brightness > 0 && (hosterr_cached.sleep == 1 || !READ_ONCE(hosterr_core_on[7]))) {
+    } else if ((brightness > 0 || power_wake) && (hosterr_cached.sleep == 1 || !READ_ONCE(hosterr_core_on[7]))) {
         hosterr_zero_brightness_count = 0;
+        atomic_set(&hosterr_power_wake_count, 0);
         WRITE_ONCE(hosterr_sleep, 0);
         hosterr_cached.sleep = 0;
         update_hosterr_sleep(0);
@@ -403,8 +426,11 @@ static void hosterr_background_handler(struct work_struct *work)
         hosterr_zero_brightness_count = 0;
     }
     spin_unlock_irqrestore(&hosterr_cache_lock, flags);
-    if (target_core7_state != -1)
-        hosterr_core_control(7, HOSTERR_REQ_SYSTEM, !!target_core7_state);
+    if (target_core7_state != -1) {
+        int i;
+        for (i = 3; i <= 7; i++)
+            hosterr_core_control(i, HOSTERR_REQ_SYSTEM, !!target_core7_state);
+    }
 }
 
 static int hosterr_pm_callback(struct notifier_block *nb, unsigned long action,
@@ -440,8 +466,13 @@ static int hosterr_pm_callback(struct notifier_block *nb, unsigned long action,
         hosterr_cached.sleep = 0;
         update_hosterr_sleep(0);
         hosterr_zero_brightness_count = 0;
+        atomic_set(&hosterr_power_wake_count, 0);
         spin_unlock_irqrestore(&hosterr_cache_lock, flags);
-        hosterr_core_control(7, HOSTERR_REQ_SYSTEM, true);
+        {
+            int i;
+            for (i = 3; i <= 7; i++)
+                hosterr_core_control(i, HOSTERR_REQ_SYSTEM, true);
+        }
         queue_delayed_work(system_wq, &hosterr_background_work, msecs_to_jiffies(500));
         break;
     }
@@ -1179,6 +1210,7 @@ static void sugov_exit(struct cpufreq_policy *policy)
 		atomic_set(&hosterr_timer_running, 0);
 		cancel_delayed_work_sync(&hosterr_background_work);
 		unregister_pm_notifier(&hosterr_pm_nb);
+		unregister_trace_android_vh_pass_input_event(hosterr_input_event_handler, NULL);
 		if (hosterr_bl_registered) {
 			backlight_unregister_notifier(&hosterr_bl_nb);
 			hosterr_bl_registered = false;
@@ -1206,6 +1238,7 @@ static int sugov_start(struct cpufreq_policy *policy)
 	if (!hosterr_works_init) {
 		INIT_DELAYED_WORK(&hosterr_background_work, hosterr_background_handler);
 		register_pm_notifier(&hosterr_pm_nb);
+		register_trace_android_vh_pass_input_event(hosterr_input_event_handler, NULL);
 		spin_lock_init(&hosterr_cache_lock);
 		spin_lock_irqsave(&hosterr_cache_lock, flags);
 		hosterr_cached.max_mode	  = hosterr_max_mode;
