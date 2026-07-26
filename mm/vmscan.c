@@ -1203,8 +1203,16 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
 		 * same address_space.
 		 */
 		if (reclaimed && page_is_file_lru(page) &&
-		    !mapping_exiting(mapping) && !dax_mapping(mapping))
+		    !mapping_exiting(mapping) && !dax_mapping(mapping)) {
+			bool keep = false;
+
+			trace_android_vh_keep_reclaimed_page(page, refcount, &keep);
+			if (keep)
+				goto cannot_free;
+
 			shadow = workingset_eviction(page, target_memcg);
+		}
+		trace_android_vh_clear_reclaimed_page(page, reclaimed);
 		__delete_from_page_cache(page, shadow);
 		xa_unlock_irq(&mapping->i_pages);
 
@@ -1437,6 +1445,8 @@ retry:
 		enum page_references references = PAGEREF_RECLAIM;
 		bool dirty, writeback, may_enter_fs;
 		unsigned int nr_pages;
+		bool activate = false;
+		bool keep = false;
 
 		cond_resched();
 
@@ -1445,6 +1455,8 @@ retry:
 
 		if (!trylock_page(page))
 			goto keep;
+
+		trace_android_vh_shrink_page_lock_owner_set(page);
 
 		VM_BUG_ON_PAGE(PageActive(page), page);
 
@@ -1474,6 +1486,15 @@ retry:
 		 * is all dirty unqueued pages.
 		 */
 		page_check_dirty_writeback(page, &dirty, &writeback);
+
+		trace_android_vh_shrink_page_list(page, dirty, writeback,
+				&activate, &keep);
+		if (activate)
+			goto activate_locked;
+
+		if (keep)
+			goto keep_locked;
+
 		if (dirty || writeback)
 			stat->nr_dirty++;
 
@@ -1562,6 +1583,7 @@ retry:
 
 			/* Case 3 above */
 			} else {
+				trace_android_vh_shrink_page_lock_owner_clear(page);
 				unlock_page(page);
 				wait_on_page_writeback(page);
 				/* then go back and try same page again */
@@ -1591,6 +1613,7 @@ retry:
 		if (do_demote_pass &&
 		    (thp_migration_supported() || !PageTransHuge(page))) {
 			list_add(&page->lru, &demote_pages);
+			trace_android_vh_shrink_page_lock_owner_clear(page);
 			unlock_page(page);
 			continue;
 		}
@@ -1770,6 +1793,7 @@ retry:
 			if (!try_to_release_page(page, sc->gfp_mask))
 				goto activate_locked;
 			if (!mapping && page_count(page) == 1) {
+				trace_android_vh_shrink_page_lock_owner_clear(page);
 				unlock_page(page);
 				if (put_page_testzero(page))
 					goto free_it;
@@ -1806,6 +1830,7 @@ retry:
 							 sc->target_mem_cgroup))
 			goto keep_locked;
 
+		trace_android_vh_shrink_page_lock_owner_clear(page);
 		unlock_page(page);
 free_it:
 		/*
@@ -1862,6 +1887,7 @@ keep_locked:
 		 * usage here, which is to clear the try-lock bit.
 		 */
 		trace_android_vh_page_trylock_get_result(page, &page_trylock_result);
+		trace_android_vh_shrink_page_lock_owner_clear(page);
 		unlock_page(page);
 keep:
 		list_add(&page->lru, &ret_pages);
@@ -3000,6 +3026,7 @@ static struct lruvec *get_lruvec(struct mem_cgroup *memcg, int nid)
 
 static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
 {
+	int swappiness;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
@@ -3007,7 +3034,10 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
 		mem_cgroup_get_nr_swap_pages(memcg) <= 0)
 		return 0;
 
-	return mem_cgroup_swappiness(memcg);
+	swappiness = mem_cgroup_swappiness(memcg);
+	trace_android_vh_tune_swappiness(&swappiness);
+
+	return swappiness;
 }
 
 static int get_nr_gens(struct lruvec *lruvec, int type)
@@ -4610,7 +4640,7 @@ static bool sort_page(struct lruvec *lruvec, struct page *page, struct scan_cont
 	return false;
 }
 
-static bool isolate_page(struct lruvec *lruvec, struct page *page, struct scan_control *sc)
+bool isolate_page(struct lruvec *lruvec, struct page *page, struct scan_control *sc)
 {
 	bool success;
 
@@ -4647,6 +4677,7 @@ static bool isolate_page(struct lruvec *lruvec, struct page *page, struct scan_c
 
 	return true;
 }
+EXPORT_SYMBOL_GPL(isolate_page);
 
 static int scan_pages(struct lruvec *lruvec, struct scan_control *sc,
 		      int type, int tier, struct list_head *list)
@@ -4850,6 +4881,12 @@ retry:
 	sc->nr_reclaimed += reclaimed;
 
 	list_for_each_entry_safe_reverse(page, next, &list, lru) {
+		bool bypass = false;
+
+		trace_android_vh_evict_pages_bypass(page, &bypass);
+		if (bypass)
+			continue;
+
 		if (!page_evictable(page)) {
 			list_del(&page->lru);
 			putback_lru_page(page);
@@ -4952,6 +4989,7 @@ static bool should_abort_scan(struct lruvec *lruvec, unsigned long seq,
 	int i;
 	DEFINE_MAX_SEQ(lruvec);
 
+	trace_android_vh_mglru_should_abort_scan(&sc->nr_reclaimed);
 	if (!current_is_kswapd()) {
 		/* age each memcg at most once to ensure fairness */
 		if (max_seq - seq > 1)
@@ -6726,6 +6764,7 @@ static bool kswapd_shrink_node(pg_data_t *pgdat,
 
 		sc->nr_to_reclaim += max(high_wmark_pages(zone), SWAP_CLUSTER_MAX);
 	}
+	trace_android_rvh_kswapd_shrink_node(&sc->nr_to_reclaim);
 
 	/*
 	 * Historically care was taken to put equal pressure on all zones but
@@ -7504,7 +7543,7 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
 		return NODE_RECLAIM_NOSCAN;
 
 	ret = __node_reclaim(pgdat, gfp_mask, order);
-	clear_bit(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
+	clear_bit_unlock(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
 
 	if (!ret)
 		count_vm_event(PGSCAN_ZONE_RECLAIM_FAILED);
