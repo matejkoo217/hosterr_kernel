@@ -9,6 +9,7 @@
 #include <linux/page_owner.h>
 #include <linux/page_pinner.h>
 #include <linux/page_idle.h>
+#include <linux/kshrink_lruvecd.h>
 #include <linux/rcupdate.h>
 /*
  * struct page extension
@@ -74,6 +75,9 @@ struct page_ext_operations page_idle_ops = {
 #endif
 
 static struct page_ext_operations *page_ext_ops[] = {
+#ifdef CONFIG_KSHRINK_LRUVECD
+	&kshrink_page_ext_ops,
+#endif
 #ifdef CONFIG_PAGE_OWNER
 	&page_owner_ops,
 #endif

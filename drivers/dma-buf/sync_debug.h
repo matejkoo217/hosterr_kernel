@@ -42,7 +42,9 @@ struct sync_timeline {
 	struct list_head	pt_list;
 	spinlock_t		lock;
 
+#ifdef CONFIG_DEBUG_FS
 	struct list_head	sync_timeline_list;
+#endif
 };
 
 static inline struct sync_timeline *dma_fence_parent(struct dma_fence *fence)
@@ -62,11 +64,18 @@ struct sync_pt {
 	struct rb_node node;
 };
 
-extern const struct file_operations sw_sync_debugfs_fops;
+extern const struct file_operations sw_sync_fops;
 
+#ifdef CONFIG_DEBUG_FS
 void sync_timeline_debug_add(struct sync_timeline *obj);
 void sync_timeline_debug_remove(struct sync_timeline *obj);
 void sync_file_debug_add(struct sync_file *fence);
 void sync_file_debug_remove(struct sync_file *fence);
+#else
+static inline void sync_timeline_debug_add(struct sync_timeline *obj) { }
+static inline void sync_timeline_debug_remove(struct sync_timeline *obj) { }
+static inline void sync_file_debug_add(struct sync_file *fence) { }
+static inline void sync_file_debug_remove(struct sync_file *fence) { }
+#endif
 
 #endif /* _LINUX_SYNC_H */

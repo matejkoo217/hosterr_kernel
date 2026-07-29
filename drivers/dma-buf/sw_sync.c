@@ -7,6 +7,8 @@
 
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/miscdevice.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/sync_file.h>
@@ -404,9 +406,21 @@ static long sw_sync_ioctl(struct file *file, unsigned int cmd,
 	}
 }
 
-const struct file_operations sw_sync_debugfs_fops = {
+const struct file_operations sw_sync_fops = {
 	.open           = sw_sync_debugfs_open,
 	.release        = sw_sync_debugfs_release,
 	.unlocked_ioctl = sw_sync_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
 };
+
+static struct miscdevice mi_sw_sync_device = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "mi_sw_sync",
+	.fops = &sw_sync_fops,
+};
+
+static int __init mi_sw_sync_init(void)
+{
+	return misc_register(&mi_sw_sync_device);
+}
+late_initcall(mi_sw_sync_init);

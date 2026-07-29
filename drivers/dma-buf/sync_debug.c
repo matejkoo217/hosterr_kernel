@@ -8,6 +8,8 @@
 #include <linux/debugfs.h>
 #include "sync_debug.h"
 
+#ifdef CONFIG_DEBUG_FS
+
 static struct dentry *dbgfs;
 
 static LIST_HEAD(sync_timeline_list_head);
@@ -122,10 +124,14 @@ static void sync_print_sync_file(struct seq_file *s,
 				  struct sync_file *sync_file)
 {
 	char buf[128];
+	const char *name = NULL;
 	int i;
 
-	seq_printf(s, "[%p] %s: %s\n", sync_file,
-		   sync_file_get_name(sync_file, buf, sizeof(buf)),
+	if (sync_file->fence->ops->get_timeline_name)
+		name = sync_file->fence->ops->get_timeline_name(sync_file->fence);
+	strscpy(buf, name ?: "<unknown>", sizeof(buf));
+
+	seq_printf(s, "[%p] %s: %s\n", sync_file, buf,
 		   sync_status_str(dma_fence_get_status(sync_file->fence)));
 
 	if (dma_fence_is_array(sync_file->fence)) {
@@ -183,8 +189,10 @@ static __init int sync_debugfs_init(void)
 	debugfs_create_file_unsafe("info", 0444, dbgfs, NULL,
 				   &sync_info_debugfs_fops);
 	debugfs_create_file_unsafe("sw_sync", 0644, dbgfs, NULL,
-				   &sw_sync_debugfs_fops);
+				   &sw_sync_fops);
 
 	return 0;
 }
 late_initcall(sync_debugfs_init);
+
+#endif /* CONFIG_DEBUG_FS */

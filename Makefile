@@ -1048,7 +1048,7 @@ KBUILD_LDFLAGS	+= -plugin-opt=-warn-stack-size=$(CONFIG_FRAME_WARN)
 endif
 endif
 #Enable MLGO for register allocation.
-KBUILD_LDFLAGS += -mllvm -regalloc-enable-advisor=release
+KBUILD_LDFLAGS += -mllvm -regalloc-enable-advisor=default
 endif
 
 ifdef CONFIG_LTO

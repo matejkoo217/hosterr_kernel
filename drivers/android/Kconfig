@@ -54,6 +54,13 @@ config ANDROID_BINDER_IPC_SELFTEST
 	  exhaustively with combinations of various buffer sizes and
 	  alignments.
 
+config BINDER_SCHED_OPT
+	bool "Binder UI transaction scheduling optimization"
+	depends on ANDROID_BINDER_IPC && ANDROID_VENDOR_HOOKS
+	default y
+	help
+	  Apply the UI transaction scheduling policy as built-in code.
+
 config ANDROID_DEBUG_SYMBOLS
 	bool "Android Debug Symbols"
 	help
