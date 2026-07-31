@@ -264,6 +264,13 @@ source "security/safesetid/Kconfig"
 source "security/lockdown/Kconfig"
 source "security/landlock/Kconfig"
 
+config R3_AUDIT_LSM
+	bool "R3 module read audit LSM"
+	depends on SECURITY
+	default y
+	help
+	  Record module file reads without affecting module loading.
+
 source "security/integrity/Kconfig"
 
 choice

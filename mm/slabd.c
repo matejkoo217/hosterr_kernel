@@ -49,6 +49,7 @@ struct kshrink_slabd_request {
 	int nid;
 	int priority;
 	struct mem_cgroup *memcg;
+	bool memcg_pinned;
 };
 
 static DEFINE_SPINLOCK(kshrink_slabd_lock);
@@ -131,7 +132,7 @@ static int kshrink_slabd(void *unused)
 
 		shrink_slab(request.gfp_mask, request.nid, request.memcg,
 			    request.priority);
-		if (request.memcg)
+		if (request.memcg_pinned)
 			css_put(&request.memcg->css);
 		WRITE_ONCE(kshrink_slabd_completed,
 			   READ_ONCE(kshrink_slabd_completed) + 1);
@@ -182,19 +183,22 @@ bool kshrink_slabd_queue(gfp_t gfp_mask, int nid,
 	spin_lock_irqsave(&kshrink_slabd_lock, flags);
 	if (!kshrink_slabd_pending) {
 		struct mem_cgroup *pinned = memcg;
+		bool memcg_pinned = false;
 
 		/* ko did not pin; built-in must keep the memcg alive. */
-		if (pinned && !mem_cgroup_is_root(pinned) &&
-		    !css_tryget_online(&pinned->css))
-			pinned = NULL;
-		else if (pinned && mem_cgroup_is_root(pinned))
-			pinned = memcg; /* root needs no ref */
+		if (pinned && !mem_cgroup_is_root(pinned)) {
+			if (!css_tryget_online(&pinned->css))
+				pinned = NULL;
+			else
+				memcg_pinned = true;
+		}
 
 		if (pinned || !memcg) {
 			kshrink_slabd_request.gfp_mask = gfp_mask;
 			kshrink_slabd_request.nid = nid;
 			kshrink_slabd_request.priority = priority;
 			kshrink_slabd_request.memcg = pinned;
+			kshrink_slabd_request.memcg_pinned = memcg_pinned;
 			kshrink_slabd_pending = true;
 			kshrink_slabd_queued++;
 			queued = true;
