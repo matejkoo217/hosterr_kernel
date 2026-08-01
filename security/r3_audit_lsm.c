@@ -1,20 +1,44 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Record module file reads for R3 diagnostics without enforcing policy.
+ * R3: Record module file reads for diagnostics.
+ * R4: Additionally block binder_prio module loading (by file name).
+ *
+ * Policy: finit_module() loads modules from files, so Android init's
+ * modules.load mechanism goes through kernel_read_file(READING_MODULE),
+ * where the originating struct file and its name are available. Blocking
+ * here covers the standard Android init module-load path. The older
+ * init_module() API (memory blob, no file) cannot be name-matched at the
+ * kernel_load_data() hook, so it is left unblocked.
  */
+#include <linux/dcache.h>
 #include <linux/fs.h>
 #include <linux/kernel_read_file.h>
 #include <linux/lsm_hooks.h>
 #include <linux/printk.h>
+#include <linux/string.h>
+
+#define R3_BLOCK_NAME "binder_prio"
 
 static int r3_audit_kernel_read_file(struct file *file,
 				    enum kernel_read_file_id id, bool unused)
 {
-	if (id == READING_MODULE) {
-		if (file)
-			pr_info_ratelimited("r3_audit: module read %pD\n", file);
-		else
-			pr_info_ratelimited("r3_audit: module read path-unavailable\n");
+	const struct dentry *dentry;
+
+	if (id != READING_MODULE)
+		return 0;
+
+	if (file) {
+		pr_info_ratelimited("r3_audit: module read %pD\n", file);
+
+		dentry = file->f_path.dentry;
+
+		if (dentry && dentry->d_name.name &&
+		    strstr((const char *)dentry->d_name.name, R3_BLOCK_NAME)) {
+			pr_info("r3_audit: BLOCKED binder_prio module load\n");
+			return -EPERM;
+		}
+	} else {
+		pr_info_ratelimited("r3_audit: module read path-unavailable\n");
 	}
 
 	return 0;

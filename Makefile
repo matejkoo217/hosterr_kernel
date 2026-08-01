@@ -792,7 +792,8 @@ KBUILD_CFLAGS	+= $(call cc-disable-warning, format-overflow)
 KBUILD_CFLAGS	+= $(call cc-disable-warning, address-of-packed-member)
 
 #Enable MLGO for register allocation.
-KBUILD_CFLAGS   += -mllvm -regalloc-enable-advisor=release
+# R4 build fix: clang 19.1.7 lacks MLGO advisor component, disable to build
+# KBUILD_CFLAGS   += -mllvm -regalloc-enable-advisor=release
 #Enable hot cold split optimization
 KBUILD_CFLAGS   += -mllvm -hot-cold-split=true
 
@@ -1048,7 +1049,8 @@ KBUILD_LDFLAGS	+= -plugin-opt=-warn-stack-size=$(CONFIG_FRAME_WARN)
 endif
 endif
 #Enable MLGO for register allocation.
-KBUILD_LDFLAGS += -mllvm -regalloc-enable-advisor=default
+# R4 build fix: disable MLGO advisor for link (clang 19.1.7 lacks component)
+# KBUILD_LDFLAGS += -mllvm -regalloc-enable-advisor=default
 endif
 
 ifdef CONFIG_LTO
