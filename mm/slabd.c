@@ -228,8 +228,8 @@ static void kshrink_slabd_bypass(void *data, gfp_t gfp_mask, int nid,
 	}
 
 	curr_jiffies = jiffies;
-	diff_jiffies = curr_jiffies - prev_jiffies;
-	prev_jiffies = curr_jiffies;
+	diff_jiffies = curr_jiffies - READ_ONCE(prev_jiffies);
+	WRITE_ONCE(prev_jiffies, curr_jiffies);
 
 	if (current == READ_ONCE(kshrink_slabd_task) || (diff_jiffies < HZ * 1)) {
 		*bypass = false;
