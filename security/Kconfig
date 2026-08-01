@@ -269,7 +269,11 @@ config R3_AUDIT_LSM
 	depends on SECURITY
 	default y
 	help
-	  Record module file reads without affecting module loading.
+	  Record module file reads (kernel_read_file, READING_MODULE) for
+	  diagnostics. Since R4, block loading of the binder_prio module by
+	  exact file name (binder_prio.ko). finit_module() covers the
+	  Android init modules.load path; the older init_module() memory
+	  path is intentionally not intercepted.
 
 source "security/integrity/Kconfig"
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * R3: Record module file reads for diagnostics.
- * R4: Additionally block binder_prio module loading (by file name).
+ * R4: Additionally block binder_prio module loading (by exact file name).
  *
  * Policy: finit_module() loads modules from files, so Android init's
  * modules.load mechanism goes through kernel_read_file(READING_MODULE),
@@ -17,7 +17,8 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 
-#define R3_BLOCK_NAME "binder_prio"
+#define R3_BLOCK_FILENAME "binder_prio.ko"
+#define R3_BLOCK_FILENAME_LEN (sizeof(R3_BLOCK_FILENAME) - 1)
 
 static int r3_audit_kernel_read_file(struct file *file,
 				    enum kernel_read_file_id id, bool unused)
@@ -33,8 +34,10 @@ static int r3_audit_kernel_read_file(struct file *file,
 		dentry = file->f_path.dentry;
 
 		if (dentry && dentry->d_name.name &&
-		    strstr((const char *)dentry->d_name.name, R3_BLOCK_NAME)) {
-			pr_info("r3_audit: BLOCKED binder_prio module load\n");
+		    dentry->d_name.len == R3_BLOCK_FILENAME_LEN &&
+		    !memcmp(dentry->d_name.name, R3_BLOCK_FILENAME,
+			    R3_BLOCK_FILENAME_LEN)) {
+			pr_info_ratelimited("r3_audit: BLOCKED binder_prio module load\n");
 			return -EPERM;
 		}
 	} else {
