@@ -181,8 +181,9 @@ DECLARE_HOOK(android_vh_do_traversal_lruvec,
 	TP_PROTO(struct lruvec *lruvec),
 	TP_ARGS(lruvec));
 DECLARE_HOOK(android_vh_page_should_be_protected,
-	TP_PROTO(struct page *page, bool *should_protect),
-	TP_ARGS(page, should_protect));
+	TP_PROTO(struct page *page, unsigned long nr_scanned,
+	s8 priority, u64 *ext, int *should_protect),
+	TP_ARGS(page, nr_scanned, priority, ext, should_protect));
 DECLARE_HOOK(android_vh_mark_page_accessed,
 	TP_PROTO(struct page *page),
 	TP_ARGS(page));
