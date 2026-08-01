@@ -42,6 +42,7 @@
 #include <linux/sched/mm.h>
 #include <linux/seq_file.h>
 #include <linux/spinlock.h>
+#include <linux/swap.h>
 #include <linux/topology.h>
 #include <linux/wait.h>
 
@@ -157,7 +158,7 @@ static int kshrink_slabd(void *unused)
 	return 0;
 }
 
-static bool kshrink_slabd_queue(gfp_t gfp_mask, int nid,
+bool kshrink_slabd_queue(gfp_t gfp_mask, int nid,
 				struct mem_cgroup *memcg, int priority)
 {
 	unsigned long flags;
