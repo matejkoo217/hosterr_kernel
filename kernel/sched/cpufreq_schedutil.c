@@ -23,6 +23,8 @@
 #include <linux/topology.h>
 #include <linux/backlight.h>
 #include <linux/input.h>
+#include <linux/kprobes.h>
+#include <linux/notifier.h>
 #include <trace/hooks/evdev.h>
 #ifndef SCHED_CPUFREQ_IOWAIT
 #define SCHED_CPUFREQ_IOWAIT	0x1
@@ -36,9 +38,13 @@
 struct hosterr_cache {
 	unsigned int max_mode;
 	unsigned int sleep;
+	unsigned int sleep_enabled;
 	unsigned int down_damping;
 	unsigned int bend_shift;
+	unsigned int util_threshold;
 };
+static struct hosterr_cache hosterr_cached;
+static DEFINE_SPINLOCK(hosterr_cache_lock);
 unsigned int hosterr_max_mode	  = 0;
 
 ATOMIC_NOTIFIER_HEAD(hosterr_max_mode_notifier_list);
@@ -53,27 +59,101 @@ static void update_hosterr_max_mode(unsigned int val)
 }
 
 unsigned int hosterr_sleep		 = 0;
+unsigned int hosterr_sleep_enabled   = 1;
 static void update_hosterr_sleep(unsigned int val)
 {
 	atomic_notifier_call_chain(&hosterr_sleep_notifier_list, val, NULL);
 }
 static unsigned int hosterr_down_damping  = 4;
 static unsigned int hosterr_bend_shift	 = 3;
+static unsigned int hosterr_util_threshold = 10;
+static unsigned int hosterr_cpus = 7;
 #define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
 static struct backlight_device *hosterr_bd = NULL;
-static bool hosterr_max_mode_saved = false;
-static atomic_t hosterr_power_wake_count = ATOMIC_INIT(0);
-static struct hosterr_cache hosterr_cached;
-static DEFINE_SPINLOCK(hosterr_cache_lock);
 static struct delayed_work hosterr_background_work;
-static atomic_t hosterr_timer_running = ATOMIC_INIT(0);
+static struct delayed_work hosterr_fod_accidental_work;
+static bool hosterr_max_mode_saved = false;
 static bool hosterr_works_init = false;
-static int hosterr_zero_brightness_count = 0;
+static bool hosterr_bl_registered = false;
+static bool hosterr_fod_registered = false;
+static atomic_t hosterr_power_wake_count = ATOMIC_INIT(0);
+static atomic_t hosterr_timer_running = ATOMIC_INIT(0);
 static atomic_t hosterr_brightness_cached = ATOMIC_INIT(-1);
 static DEFINE_MUTEX(hosterr_init_lock);
+static int hosterr_zero_brightness_count = 0;
 static int hosterr_policy_count = 0;
-static bool hosterr_bl_registered = false;
 static enum cpuhp_state hosterr_hp_state = 0;
+
+static int find_pwr_dev(struct device *dev, void *data)
+{
+	struct input_dev *input = to_input_dev(dev);
+	if (test_bit(KEY_POWER, input->keybit)) {
+		*(struct input_dev **)data = input;
+		return 1;
+	}
+	return 0;
+}
+
+static void hosterr_inject_power_key(void)
+{
+	struct input_dev *pwr_dev = NULL;
+	class_for_each_device(&input_class, NULL, &pwr_dev, find_pwr_dev);
+	if (pwr_dev) {
+		input_event(pwr_dev, EV_KEY, KEY_POWER, 1);
+		input_sync(pwr_dev);
+		input_event(pwr_dev, EV_KEY, KEY_POWER, 0);
+		input_sync(pwr_dev);
+	}
+}
+
+static void hosterr_fod_accidental_handler(struct work_struct *work)
+{
+	int brightness = atomic_read(&hosterr_brightness_cached);
+	if (brightness == 0 && READ_ONCE(hosterr_sleep) == 1) {
+		pr_info("[hosterr] Accidental touch detected (still dark), resuming sleep.\n");
+		mod_delayed_work(system_wq, &hosterr_background_work, 0);
+	}
+}
+
+static int pre_update_fod_press_status(struct kprobe *p, struct pt_regs *regs)
+{
+	int state = (int)regs->regs[0];
+	if (state == 1) {
+		pr_info("[hosterr] update_fod_press_status: state=1\n");
+		if (READ_ONCE(hosterr_sleep) == 1) {
+			hosterr_inject_power_key();
+			schedule_delayed_work(&hosterr_fod_accidental_work, msecs_to_jiffies(2000));
+		}
+	}
+	return 0;
+}
+
+static struct kprobe hosterr_fod_kp = {
+	.symbol_name = "update_fod_press_status",
+	.pre_handler = pre_update_fod_press_status,
+};
+
+static void register_hosterr_fod_hooks(const char *mod_name)
+{
+	if (mod_name && strcmp(mod_name, "xiaomi_touch") == 0 && !hosterr_fod_registered) {
+		if (register_kprobe(&hosterr_fod_kp) == 0) {
+			pr_info("[hosterr] Hooked FOD from Touch Driver\n");
+			hosterr_fod_registered = true;
+		}
+	}
+}
+
+static int hosterr_fod_module_notifier(struct notifier_block *self, unsigned long val, void *data)
+{
+	struct module *mod = data;
+	if (val == MODULE_STATE_COMING)
+		register_hosterr_fod_hooks(mod->name);
+	return 0;
+}
+
+static struct notifier_block hosterr_fod_nb = {
+	.notifier_call = hosterr_fod_module_notifier,
+};
 
 unsigned int hosterr_core_on[HOSTERR_NUM_CORES] = {
     [0 ... HOSTERR_NUM_CORES - 1] = 1
@@ -85,6 +165,21 @@ unsigned int hosterr_core_on[HOSTERR_NUM_CORES] = {
 static unsigned int hosterr_core_reqs[HOSTERR_NUM_CORES] = {
 	[0 ... HOSTERR_NUM_CORES - 1] = HOSTERR_REQ_USER | HOSTERR_REQ_SYSTEM
 };
+
+static void dump_irqs_for_cpu(int cpu)
+{
+    struct irq_desc *desc;
+    int irq;
+    for_each_irq_desc(irq, desc) {
+        const struct cpumask *mask;
+        mask = irq_data_get_affinity_mask(&desc->irq_data);
+        if (!mask)
+            continue;
+        if (cpumask_test_cpu(cpu, mask))
+            pr_info("[hosterr] IRQ %d still affined to CPU%d mask=%*pb\n",
+                    irq, cpu, cpumask_pr_args(mask));
+    }
+}
 
 static int hosterr_core_control(unsigned int cpu, unsigned int mask, bool on)
 {
@@ -124,7 +219,13 @@ static int hosterr_core_control(unsigned int cpu, unsigned int mask, bool on)
 			spin_unlock_irqrestore(&hosterr_cache_lock, flags);
 		}
 	} else {
-		ret = device_offline(dev);
+		if (!should_be_on) {
+		    pr_debug("[hosterr] Offlining CPU%d\n", cpu);
+		    dump_irqs_for_cpu(cpu);
+		    ret = device_offline(dev);
+		    pr_debug("[hosterr] CPU%d offline ret=%d\n", cpu, ret);
+		    dump_irqs_for_cpu(cpu);
+		}
 	}
 	return ret;
 }
@@ -144,7 +245,6 @@ struct sugov_policy {
 	u64			last_freq_update_time;
 	s64			freq_update_delay_ns;
 	unsigned int		next_freq;
-	unsigned long	   last_util;
 	unsigned int		cached_raw_freq;
 
 	/* Hosterr tracking variables */
@@ -180,6 +280,7 @@ struct sugov_cpu {
 	unsigned long		util;
 	unsigned long		bw_dl;
 	unsigned long		max;
+	unsigned long		last_util;
 
 	/* The field below is for single-CPU policies only: */
 #ifdef CONFIG_NO_HZ_COMMON
@@ -240,11 +341,37 @@ HOSTERR_PARAM_SYNC_SET(max_mode, hosterr_max_mode)
 HOSTERR_PARAM_SYNC_SET(sleep, hosterr_sleep)
 HOSTERR_PARAM_SYNC_SET(bend_shift, hosterr_bend_shift)
 HOSTERR_PARAM_SYNC_SET_BOUNDS(down_damping, hosterr_down_damping, 2, 32)
+HOSTERR_PARAM_SYNC_SET_BOUNDS(util_threshold, hosterr_util_threshold, 0, 100)
 module_param_cb(max_mode, &hosterr_max_mode_ops, &hosterr_max_mode, 0644);
 module_param_cb(sleep, &hosterr_sleep_ops, &hosterr_sleep, 0644);
 module_param_cb(bend_shift, &hosterr_bend_shift_ops, &hosterr_bend_shift, 0644);
 module_param_cb(down_damping, &hosterr_down_damping_ops, &hosterr_down_damping, 0644);
+module_param_cb(util_threshold, &hosterr_util_threshold_ops, &hosterr_util_threshold, 0644);
+module_param_named(cpus, hosterr_cpus, uint, 0644);
 
+static int hosterr_sleep_enabled_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int v;
+	unsigned long flags;
+	int ret = kstrtouint(val, 10, &v);
+	if (ret)
+		return ret;
+	if (v > 1)
+		return -EINVAL;
+	ret = param_set_uint(val, kp);
+	if (!ret) {
+		spin_lock_irqsave(&hosterr_cache_lock, flags);
+		hosterr_cached.sleep_enabled = hosterr_sleep_enabled;
+		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+		schedule_delayed_work(&hosterr_background_work, 0);
+	}
+	return ret;
+}
+static const struct kernel_param_ops hosterr_sleep_enabled_ops = {
+	.set = hosterr_sleep_enabled_set,
+	.get = param_get_uint,
+};
+module_param_cb(sleep_enabled, &hosterr_sleep_enabled_ops, &hosterr_sleep_enabled, 0644);
 static int hosterr_cpu_online_prep(unsigned int cpu)
 {
     if (cpu >= HOSTERR_NUM_CORES)
@@ -290,7 +417,7 @@ static inline unsigned long hosterr_bend_utilization(unsigned long util,
 	if (util > max)
 		util = max;
 	shift = READ_ONCE(hosterr_cached.bend_shift);
-	if (!shift || util >= mult_frac(max, 7, 8))
+	if (!shift || util >= (max - (max >> 3)))
 		return util;
 	return util - (util >> shift);
 }
@@ -298,10 +425,10 @@ static inline unsigned long hosterr_bend_utilization(unsigned long util,
 #define PREDICT_NOISE_FLOOR (SCHED_CAPACITY_SCALE >> 6)
 #define OSC_MIN_DELTA(sg) ((sg)->policy->cpuinfo.max_freq >> 4) // ~6% of max
 
-static inline unsigned long hosterr_predict_util(struct sugov_policy *sg_policy,
+static inline unsigned long hosterr_predict_util(struct sugov_cpu *sg_cpu,
                                       unsigned long util, unsigned long max)
 {
-    long delta = (long)util - (long)sg_policy->last_util;
+    long delta = (long)util - (long)sg_cpu->last_util;
     long predicted;
     if (abs(delta) > PREDICT_NOISE_FLOOR)
         predicted = (long)util + (delta >> 3);
@@ -311,7 +438,7 @@ static inline unsigned long hosterr_predict_util(struct sugov_policy *sg_policy,
         predicted = max;
     if (predicted < 0)
         predicted = 0;
-    sg_policy->last_util = util;
+    sg_cpu->last_util = util;
     return (unsigned long)predicted;
 }
 
@@ -320,7 +447,6 @@ static inline unsigned long hosterr_dynamic_curve(struct sugov_policy *sg_policy
 				       unsigned long max)
 {
 	unsigned int scale = sg_policy->dynamic_curve_scale;
-
 	if (!scale)
 		return util;
 	util += (unsigned long)((u64)util * scale >> 13);
@@ -345,11 +471,10 @@ static struct notifier_block hosterr_bl_nb = {
 
 static void hosterr_input_event_handler(void *unused, int head, int tail, int bufsize, int type, int code, int value)
 {
-	if (type == EV_KEY && code == KEY_POWER) {
-		if (READ_ONCE(hosterr_sleep) == 1) {
+	if (READ_ONCE(hosterr_sleep) == 1) {
+		if (type == EV_KEY && code == KEY_POWER && value == 1)
 			atomic_inc(&hosterr_power_wake_count);
-			mod_delayed_work(system_wq, &hosterr_background_work, 0);
-		}
+		mod_delayed_work(system_wq, &hosterr_background_work, 0);
 	}
 }
 
@@ -357,49 +482,82 @@ static void hosterr_background_handler(struct work_struct *work)
 {
     unsigned long flags;
     int brightness;
-    int target_core7_state = -1;
+    int target_state = -1;
+    int ret;
+    unsigned int cached_sleep;
+    unsigned int cached_sleep_enabled;
     bool power_wake;
+    bool state_changed = false;
     struct backlight_device *bd_local;
-
-    if (atomic_read(&hosterr_power_wake_count) >= 2) {
+    if (!try_module_get(THIS_MODULE))
+        return;
+    if (atomic_read(&hosterr_power_wake_count) >= 1) {
         atomic_set(&hosterr_power_wake_count, 0);
         power_wake = true;
     } else {
         power_wake = false;
     }
-
     bd_local = smp_load_acquire(&hosterr_bd);
-
     if (!bd_local) {
         mutex_lock(&hosterr_init_lock);
         bd_local = hosterr_bd;
         if (!bd_local) {
             bd_local = backlight_device_get_by_name("panel0-backlight");
             if (bd_local) {
-                backlight_register_notifier(&hosterr_bl_nb);
-                hosterr_bl_registered = true;
-                smp_store_release(&hosterr_bd, bd_local);
+                if (!get_device(&bd_local->dev)) {
+                    bd_local = NULL;
+                } else {
+                    backlight_register_notifier(&hosterr_bl_nb);
+                    hosterr_bl_registered = true;
+                    smp_store_release(&hosterr_bd, bd_local);
+                }
             }
         }
         mutex_unlock(&hosterr_init_lock);
     }
     if (bd_local) {
         brightness = bd_local->props.brightness;
-        atomic_set(&hosterr_brightness_cached, brightness);
+        if (atomic_read(&hosterr_brightness_cached) != brightness)
+            atomic_set(&hosterr_brightness_cached, brightness);
     } else {
         brightness = atomic_read(&hosterr_brightness_cached);
     }
-    if (brightness < 0)
+    if (brightness < 0) {
+        module_put(THIS_MODULE);
         return;
+    }
     spin_lock_irqsave(&hosterr_cache_lock, flags);
-    if (brightness == 0 && hosterr_cached.sleep == 0) {
+    cached_sleep = hosterr_cached.sleep;
+    cached_sleep_enabled = hosterr_cached.sleep_enabled;
+    spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+
+    if (!cached_sleep_enabled && cached_sleep == 1) {
+        power_wake = true;
+        state_changed = true;
+    } else if (brightness == 0 && cached_sleep == 0 && cached_sleep_enabled) {
+        state_changed = true;
+    } else if ((brightness > 0 || power_wake) &&
+               (cached_sleep == 1 || !READ_ONCE(hosterr_core_on[7]))) {
+        state_changed = true;
+    }
+    if (!state_changed) {
+        if (brightness != 0 || (!power_wake && brightness == 0)) {
+            spin_lock_irqsave(&hosterr_cache_lock, flags);
+            hosterr_zero_brightness_count = 0;
+            spin_unlock_irqrestore(&hosterr_cache_lock, flags);
+        }
+        module_put(THIS_MODULE);
+        return;
+    }
+    spin_lock_irqsave(&hosterr_cache_lock, flags);
+    if (brightness == 0 && hosterr_cached.sleep == 0 && hosterr_cached.sleep_enabled) {
         hosterr_zero_brightness_count++;
-        if (hosterr_zero_brightness_count >= 2) {
+        if (hosterr_zero_brightness_count >= 1) {
             hosterr_zero_brightness_count = 0;
             WRITE_ONCE(hosterr_sleep, 1);
             hosterr_cached.sleep = 1;
             update_hosterr_sleep(1);
-            target_core7_state = 0;
+            target_state = 0;
             if (hosterr_cached.max_mode == 1) {
                 hosterr_max_mode_saved = true;
                 update_hosterr_max_mode(0);
@@ -416,21 +574,46 @@ static void hosterr_background_handler(struct work_struct *work)
         WRITE_ONCE(hosterr_sleep, 0);
         hosterr_cached.sleep = 0;
         update_hosterr_sleep(0);
-        target_core7_state = 1;
+        target_state = 1;
         if (hosterr_max_mode_saved) {
             update_hosterr_max_mode(1);
             hosterr_cached.max_mode = 1;
             hosterr_max_mode_saved = false;
         }
+        if (power_wake && brightness == 0) {
+            hosterr_zero_brightness_count = 1;
+            if (atomic_read(&hosterr_timer_running)) {
+                schedule_delayed_work(&hosterr_background_work, msecs_to_jiffies(2000));
+            }
+        }
     } else {
         hosterr_zero_brightness_count = 0;
     }
     spin_unlock_irqrestore(&hosterr_cache_lock, flags);
-    if (target_core7_state != -1) {
+    if (target_state != -1) {
         int i;
-        for (i = 3; i <= 7; i++)
-            hosterr_core_control(i, HOSTERR_REQ_SYSTEM, !!target_core7_state);
+        if (target_state == 1) {
+            for (i = 0; i < HOSTERR_NUM_CORES; i++) {
+                if (!READ_ONCE(hosterr_core_on[i])) {
+                    ret = hosterr_core_control(i, HOSTERR_REQ_SYSTEM, true);
+                    if (ret && ret != -EPERM)
+                        pr_warn("[hosterr] Restore core_control CPU%d failed: %d\n", i, ret);
+                }
+            }
+        } else {
+            unsigned int temp_cpus = READ_ONCE(hosterr_cpus);
+            while (temp_cpus > 0) {
+                int cpu = temp_cpus % 10;
+                temp_cpus /= 10;
+                if (cpu >= HOSTERR_NUM_CORES)
+                    continue;
+                ret = hosterr_core_control(cpu, HOSTERR_REQ_SYSTEM, false);
+                if (ret && ret != -EPERM)
+                    pr_warn("[hosterr] core_control CPU%d failed: %d\n", cpu, ret);
+            }
+        }
     }
+    module_put(THIS_MODULE);
 }
 
 static int hosterr_pm_callback(struct notifier_block *nb, unsigned long action,
@@ -453,6 +636,7 @@ static int hosterr_pm_callback(struct notifier_block *nb, unsigned long action,
         spin_unlock_irqrestore(&hosterr_cache_lock, flags);
         atomic_set(&hosterr_timer_running, 0);
         cancel_delayed_work_sync(&hosterr_background_work);
+        cancel_delayed_work_sync(&hosterr_fod_accidental_work);
         break;
     case PM_POST_SUSPEND:
         atomic_set(&hosterr_timer_running, 1);
@@ -470,8 +654,11 @@ static int hosterr_pm_callback(struct notifier_block *nb, unsigned long action,
         spin_unlock_irqrestore(&hosterr_cache_lock, flags);
         {
             int i;
-            for (i = 3; i <= 7; i++)
-                hosterr_core_control(i, HOSTERR_REQ_SYSTEM, true);
+            for (i = 5; i <= 7; i++) {
+                int ret = hosterr_core_control(i, HOSTERR_REQ_SYSTEM, true);
+                if (ret && ret != -EPERM)
+                    pr_warn("[hosterr] PM resume core_control CPU%d failed: %d\n", i, ret);
+            }
         }
         queue_delayed_work(system_wq, &hosterr_background_work, msecs_to_jiffies(500));
         break;
@@ -635,6 +822,7 @@ static unsigned int sugov_apply_smoothing(struct sugov_policy *sg_policy,
 					 unsigned int freq, unsigned int prev_raw)
 {
 	unsigned int w_prev, w_new, damping;
+	unsigned int drop, max_drop;
 	bool do_smooth = false;
 	bool is_prime = (arch_scale_cpu_capacity(sg_policy->policy->cpu) >= SCHED_CAPACITY_SCALE);
 	bool is_oscillating = sg_policy->is_oscillating;
@@ -666,24 +854,20 @@ static unsigned int sugov_apply_smoothing(struct sugov_policy *sg_policy,
 				if (freq < (sg_policy->policy->cpuinfo.min_freq << 1))
 					freq = (prev_raw + (freq * 3)) >> 2;
 				else if (arch_scale_cpu_capacity(sg_policy->policy->cpu) >= (SCHED_CAPACITY_SCALE * 3 / 4))
-					freq = ((prev_raw * 2) + freq) / 3;
+					freq = ((prev_raw << 1) + freq) * 342 >> 10;
 				else
 					freq = ((prev_raw * 3) + freq) >> 2;
-			} else if (is_power_of_2(damping)) {
-				unsigned int shift = ilog2(damping);
-				freq = ((prev_raw * (damping - 1)) + freq) >> shift;
 			} else {
-				freq = ((prev_raw * (damping - 1)) + freq) / damping;
+				unsigned int shift_factor = ilog2(damping);
+				freq = ((prev_raw * (damping - 1)) + freq) >> shift_factor;
 			}
 		}
-		{
-			unsigned int drop = prev_raw - freq;
-			unsigned int max_drop = (prev_raw * 512) >> 10;
-			if (drop > max_drop)
-				freq = prev_raw - max_drop;
-		}
+		drop = prev_raw - freq;
+		max_drop = prev_raw >> 1;
+		if (drop > max_drop)
+			freq = prev_raw - max_drop;
 		if (unlikely(is_oscillating)) {
-			unsigned int osc_limit = (prev_raw * 512) >> 10;
+			unsigned int osc_limit = prev_raw >> 1;
 			if (freq < osc_limit && freq > (sg_policy->policy->cpuinfo.min_freq << 1))
 				freq = osc_limit;
 		}
@@ -715,20 +899,19 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy, u64 time,
 		goto resolve;
 	}
 	if (unlikely(READ_ONCE(hosterr_cached.max_mode))) {
-		freq = policy->cpuinfo.max_freq;
+		freq = policy->max;
 		goto resolve;
 	}
-	if (policy->cpu == 7) {
-        policy->min = policy->cpuinfo.min_freq;
-    }
 	prev_raw = sg_policy->cached_raw_freq;
-	util = hosterr_predict_util(sg_policy, util, max);
 	util = hosterr_bend_utilization(util, max);
 	util = hosterr_dynamic_curve(sg_policy, util, max);
 	util = map_util_perf(util);
 	freq = map_util_freq(util, policy->cpuinfo.max_freq, max);
 	if (likely(prev_raw))
 		freq = sugov_apply_smoothing(sg_policy, freq, prev_raw);
+	if (freq > sg_policy->next_freq && !sg_policy->need_freq_update && util <= READ_ONCE(hosterr_cached.util_threshold)) {
+		return sg_policy->next_freq;
+	}
 resolve:
 	if (freq == sg_policy->cached_raw_freq && likely(!sg_policy->need_freq_update))
 		return sg_policy->next_freq;
@@ -798,12 +981,13 @@ static void sugov_update_single_freq(struct update_util_data *hook, u64 time,
 	if (!sugov_update_single_common(sg_cpu, time, flags))
 		return;
 
+	sg_cpu->util = hosterr_predict_util(sg_cpu, sg_cpu->util, sg_cpu->max);
 	next_f = get_next_freq(sg_policy, time, sg_cpu->util, sg_cpu->max);
 	/*
 	 * Do not reduce the frequency if the CPU has not been idle
 	 * recently, as the reduction is likely to be premature then.
 	 */
-	if (sugov_cpu_is_busy(sg_cpu) && next_f < sg_policy->next_freq) {
+	if (sugov_cpu_is_busy(sg_cpu) && next_f < sg_policy->next_freq && !READ_ONCE(hosterr_cached.sleep)) {
 		next_f = sg_policy->next_freq;
 
 		/* Restore cached freq as next_freq has changed */
@@ -818,7 +1002,7 @@ static void sugov_update_single_freq(struct update_util_data *hook, u64 time,
 	 * concurrently on two different CPUs for the same target and it is not
 	 * necessary to acquire the lock in the fast switch case.
 	 */
-	if (sg_policy->policy->fast_switch_enabled) {
+	if (likely(sg_policy->policy->fast_switch_enabled)) {
 		cpufreq_driver_fast_switch(sg_policy->policy, next_f);
 	} else {
 		raw_spin_lock(&sg_policy->update_lock);
@@ -850,8 +1034,12 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
 	 * Do not reduce the target performance level if the CPU has not been
 	 * idle recently, as the reduction is likely to be premature then.
 	 */
-	if (sugov_cpu_is_busy(sg_cpu) && sg_cpu->util < prev_util)
+	if (unlikely(READ_ONCE(hosterr_cached.sleep))) {
+		sg_cpu->sg_policy->policy->min = sg_cpu->sg_policy->policy->cpuinfo.min_freq;
+		sg_cpu->util = 0;
+	} else if (sugov_cpu_is_busy(sg_cpu) && sg_cpu->util < prev_util) {
 		sg_cpu->util = prev_util;
+	}
 
 	cpufreq_driver_adjust_perf(sg_cpu->cpu, map_util_perf(sg_cpu->bw_dl),
 				   map_util_perf(sg_cpu->util), sg_cpu->max);
@@ -872,6 +1060,7 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 
 		sugov_get_util(j_sg_cpu);
 		j_sg_cpu->util = sugov_iowait_apply(j_sg_cpu, time, j_sg_cpu->util, j_sg_cpu->max);
+		j_sg_cpu->util = hosterr_predict_util(j_sg_cpu, j_sg_cpu->util, j_sg_cpu->max);
 		j_util = j_sg_cpu->util;
 		j_max = j_sg_cpu->max;
 		if (!j_max)
@@ -1209,8 +1398,14 @@ static void sugov_exit(struct cpufreq_policy *policy)
         }
 		atomic_set(&hosterr_timer_running, 0);
 		cancel_delayed_work_sync(&hosterr_background_work);
+		cancel_delayed_work_sync(&hosterr_fod_accidental_work);
 		unregister_pm_notifier(&hosterr_pm_nb);
 		unregister_trace_android_vh_pass_input_event(hosterr_input_event_handler, NULL);
+		unregister_module_notifier(&hosterr_fod_nb);
+		if (hosterr_fod_registered) {
+			unregister_kprobe(&hosterr_fod_kp);
+			hosterr_fod_registered = false;
+		}
 		if (hosterr_bl_registered) {
 			backlight_unregister_notifier(&hosterr_bl_nb);
 			hosterr_bl_registered = false;
@@ -1227,6 +1422,18 @@ static void sugov_exit(struct cpufreq_policy *policy)
 	cpufreq_disable_fast_switch(policy);
 }
 
+static inline void sugov_update_curve_scale(struct sugov_policy *sg_policy, struct cpufreq_policy *policy)
+{
+    unsigned long window = policy->max - policy->min;
+    unsigned long scale = ((u64)policy->max << 10) / window;
+    unsigned long max_scale = (arch_scale_cpu_capacity(policy->cpu) >= (SCHED_CAPACITY_SCALE * 3 / 4)) ? 1024 : 2048;
+    if (unlikely(!window || window < (policy->cpuinfo.max_freq >> 1))) {
+        sg_policy->dynamic_curve_scale = 0;
+        return;
+    }
+    sg_policy->dynamic_curve_scale = (unsigned int)min(scale, max_scale);
+}
+
 static int sugov_start(struct cpufreq_policy *policy)
 {
 	struct sugov_policy *sg_policy = policy->governor_data;
@@ -1237,25 +1444,33 @@ static int sugov_start(struct cpufreq_policy *policy)
 	mutex_lock(&hosterr_init_lock);
 	if (!hosterr_works_init) {
 		INIT_DELAYED_WORK(&hosterr_background_work, hosterr_background_handler);
+		INIT_DELAYED_WORK(&hosterr_fod_accidental_work, hosterr_fod_accidental_handler);
 		register_pm_notifier(&hosterr_pm_nb);
 		register_trace_android_vh_pass_input_event(hosterr_input_event_handler, NULL);
+		register_module_notifier(&hosterr_fod_nb);
+		register_hosterr_fod_hooks("xiaomi_touch");
 		spin_lock_init(&hosterr_cache_lock);
 		spin_lock_irqsave(&hosterr_cache_lock, flags);
 		hosterr_cached.max_mode	  = hosterr_max_mode;
 		hosterr_cached.sleep		 = hosterr_sleep;
+		hosterr_cached.sleep_enabled = hosterr_sleep_enabled;
 		hosterr_cached.down_damping  = hosterr_down_damping;
 		hosterr_cached.bend_shift    = hosterr_bend_shift;
+		hosterr_cached.util_threshold = hosterr_util_threshold;
 		spin_unlock_irqrestore(&hosterr_cache_lock, flags);
 
 		if (!hosterr_bd)
 			hosterr_bd = backlight_device_get_by_name("panel0-backlight");
 
 		if (hosterr_bd) {
-			backlight_register_notifier(&hosterr_bl_nb);
-			hosterr_bl_registered = true;
+			if (get_device(&hosterr_bd->dev)) {
+				backlight_register_notifier(&hosterr_bl_nb);
+				hosterr_bl_registered = true;
+			} else {
+				hosterr_bd = NULL;
+			}
 		}
-		hp_ret = cpuhp_setup_state_nocalls(CPUHP_BP_PREPARE_DYN, "cpufreq/hosterr:prepare",
-                                           hosterr_cpu_online_prep, NULL);
+		hp_ret = cpuhp_setup_state_nocalls(CPUHP_BP_PREPARE_DYN, "cpufreq/hosterr:prepare", hosterr_cpu_online_prep, NULL);
         if (hp_ret >= 0)
             hosterr_hp_state = hp_ret;
 		atomic_set(&hosterr_timer_running, 1);
@@ -1271,21 +1486,10 @@ static int sugov_start(struct cpufreq_policy *policy)
 	sg_policy->work_in_progress	  = false;
 	sg_policy->limits_changed		= false;
 	sg_policy->cached_raw_freq	   = 0;
-	sg_policy->last_util			 = 0;
 	sg_policy->calm_window_count	 = 0;
 	sg_policy->need_freq_update	  = cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS);
 	{
-		unsigned long window = policy->max - policy->min;
-
-		if (!window || window < (policy->cpuinfo.max_freq >> 1)) {
-			sg_policy->dynamic_curve_scale = 0;
-		} else {
-			unsigned long scale = ((u64)policy->max << 10) / window;
-			unsigned long max_scale = (arch_scale_cpu_capacity(policy->cpu) >= (SCHED_CAPACITY_SCALE * 3 / 4)) ? 1024 : 2048;
-			if (scale > max_scale)
-				scale = max_scale;
-			sg_policy->dynamic_curve_scale = (unsigned int)scale;
-		}
+	sugov_update_curve_scale(sg_policy, policy);
 	}
 	for_each_cpu(cpu, policy->cpus) {
 		struct sugov_cpu *sg_cpu = &per_cpu(sugov_cpu, cpu);
@@ -1295,6 +1499,9 @@ static int sugov_start(struct cpufreq_policy *policy)
 		sg_cpu->sg_policy		= sg_policy;
 	}
 
+	if (policy->cpu == 7) {
+        policy->min = policy->cpuinfo.min_freq;
+    }
 	if (policy_is_shared(policy))
 		uu = sugov_update_shared;
 	else if (policy->fast_switch_enabled && cpufreq_driver_has_adjust_perf())
@@ -1336,16 +1543,11 @@ static void sugov_limits(struct cpufreq_policy *policy)
         cpufreq_policy_apply_limits(policy);
         mutex_unlock(&sg_policy->work_lock);
     }
-    window = policy->max - policy->min;
-    if (!window || window < (policy->cpuinfo.max_freq >> 1)) {
-        sg_policy->dynamic_curve_scale = 0;
-    } else {
-        unsigned long scale = (policy->max << 10) / window;
-        unsigned long max_scale = (arch_scale_cpu_capacity(policy->cpu) >= (SCHED_CAPACITY_SCALE * 3 / 4)) ? 1024 : 2048;
-        if (scale > max_scale)
-            scale = max_scale;
-        sg_policy->dynamic_curve_scale = (unsigned int)scale;
+    if (policy->cpu == 7) {
+        policy->min = policy->cpuinfo.min_freq;
     }
+    window = policy->max - policy->min;
+	sugov_update_curve_scale(sg_policy, policy);
     /*
      * The limits_changed update below must take place before the updates
      * of policy limits in cpufreq_set_policy() or a policy limits update

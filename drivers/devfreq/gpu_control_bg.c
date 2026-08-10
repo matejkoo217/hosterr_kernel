@@ -28,7 +28,6 @@ extern struct atomic_notifier_head hosterr_max_mode_notifier_list;
 #define PERCENTAGE_SCALE 100
 #define DYNAMIC_CURVE_SHIFT 13
 #define MIN_POLLING_MS 10
-#define MIN_EVENT_BUFFER_SIZE 1
 #define MAX_BEND_SHIFT 31
 #define INIT_DELAY_MS 2000
 #define RETRY_DELAY_MS 1000
@@ -37,10 +36,6 @@ extern struct atomic_notifier_head hosterr_max_mode_notifier_list;
 #define DEFAULT_BEND_SHIFT 1
 #define DEFAULT_DYNAMIC_CURVE_SCALE 0
 #define DEFAULT_POLLING_MS 50
-#define DEFAULT_MAX_LIFE_MS 3000
-#define DEFAULT_WAKE_GRANT_MS 250
-#define DEFAULT_INITIAL_LIFE_MS 1000
-#define DEFAULT_EVENT_BUFFER_SIZE 2
 
 static inline bool gpu_control_boost(void)
 {
@@ -56,10 +51,6 @@ struct gpu_control_bg {
 	unsigned int bend_shift;
 	unsigned int dynamic_curve_scale;
 	unsigned int polling_ms;
-	unsigned int max_life_ms;
-	unsigned int wake_grant_ms;
-	unsigned int initial_life_ms;
-	unsigned int event_buffer_size;
 	unsigned long target_freq;
 	unsigned long last_load;
 	int current_idx;
@@ -72,40 +63,20 @@ struct gpu_control_bg {
 	struct notifier_block bl_nb;
 	struct notifier_block transition_nb;
 	struct notifier_block max_mode_nb;
-	unsigned int last_polling_ms;
-	atomic_t time_left_ms;
-	atomic_t event_count;
 	bool suspended;
+	bool enabled;
 	struct completion init_done;
 	bool init_complete;
 };
-
-static void gpu_control_grant_life(struct gpu_control_bg *bg)
-{
-	int count = atomic_inc_return(&bg->event_count);
-	int old, new;
-
-	if (count < (int)bg->event_buffer_size)
-		return;
-
-	do {
-		old = atomic_read(&bg->time_left_ms);
-		if (old == 0)
-			new = bg->initial_life_ms;
-		else
-			new = min(old + (int)bg->wake_grant_ms, (int)bg->max_life_ms);
-	} while (atomic_cmpxchg(&bg->time_left_ms, old, new) != old);
-}
 
 static int gpu_max_mode_notifier(struct notifier_block *nb,
 				 unsigned long action, void *data)
 {
 	struct gpu_control_bg *bg = container_of(nb, struct gpu_control_bg, max_mode_nb);
 
-	if (action == 1) {
-		atomic_set(&bg->time_left_ms, 0);
-		atomic_set(&bg->event_count, 0);
-	}
+	if (!bg->enabled)
+		return NOTIFY_OK;
+
 	mod_delayed_work(system_freezable_wq, &bg->work, 0);
 	return NOTIFY_OK;
 }
@@ -166,15 +137,9 @@ static int gpu_transition_notifier(struct notifier_block *nb,
 {
 	struct gpu_control_bg *bg = container_of(nb, struct gpu_control_bg, transition_nb);
 
-	if (action != DEVFREQ_POSTCHANGE)
+	if (action != DEVFREQ_POSTCHANGE || !bg->enabled)
 		return NOTIFY_DONE;
 
-	if (gpu_control_boost()) {
-		atomic_set(&bg->time_left_ms, 0);
-		atomic_set(&bg->event_count, 0);
-	} else {
-		gpu_control_grant_life(bg);
-	}
 	mod_delayed_work(system_freezable_wq, &bg->work, 0);
 	return NOTIFY_OK;
 }
@@ -187,33 +152,32 @@ static void gpu_control_work(struct work_struct *work)
 	unsigned long load, bent_load, range;
 	unsigned long ideal_freq;
 	int ideal_idx, min_idx, max_idx;
-	bool ascending;
+	bool ascending, need_step = false;
 	unsigned int next_poll = bg->polling_ms;
-	int time_left;
 
 	if (!df || bg->suspended)
 		return;
 
 	mutex_lock(&bg->lock);
 
-	time_left = atomic_read(&bg->time_left_ms);
-
-	if (gpu_control_boost() || time_left == 0)
-		goto apply_qos;
-
-	stat = &df->last_status;
-	if (stat->total_time == 0)
-		goto reschedule;
-
-	load = (stat->busy_time * PERCENTAGE_SCALE) / stat->total_time;
-	bg->last_load = load;
+	if (!bg->enabled) {
+		if (bg->qos_active) {
+			dev_pm_qos_update_request(&bg->qos_min_req, 0);
+			dev_pm_qos_update_request(&bg->qos_max_req, PM_QOS_MAX_FREQUENCY_DEFAULT_VALUE);
+		}
+		goto out_unlock;
+	}
 
 	if (!df->profile || !df->profile->freq_table || df->profile->max_state == 0) {
+		stat = &df->last_status;
+		if (stat->total_time != 0)
+			bg->last_load = (stat->busy_time * PERCENTAGE_SCALE) / stat->total_time;
+
 		if (gpu_control_boost())
 			bg->target_freq = bg->max_limit;
-		else if (load > bg->up_threshold)
+		else if (bg->last_load > bg->up_threshold)
 			bg->target_freq = bg->max_limit;
-		else if (load < bg->down_threshold)
+		else if (bg->last_load < bg->down_threshold)
 			bg->target_freq = bg->hw_min_freq;
 		goto apply_qos;
 	}
@@ -221,6 +185,18 @@ static void gpu_control_work(struct work_struct *work)
 	ascending = df->profile->freq_table[0] < df->profile->freq_table[df->profile->max_state - 1];
 	min_idx = find_nearest_index(df, bg->hw_min_freq);
 	max_idx = find_nearest_index(df, bg->max_limit);
+
+	stat = &df->last_status;
+	if (stat->total_time == 0) {
+		if (gpu_control_boost()) {
+			ideal_idx = max_idx;
+			goto apply_step;
+		}
+		goto out_unlock;
+	}
+
+	load = (stat->busy_time * PERCENTAGE_SCALE) / stat->total_time;
+	bg->last_load = load;
 
 	if (gpu_control_boost()) {
 		ideal_idx = max_idx;
@@ -240,10 +216,14 @@ static void gpu_control_work(struct work_struct *work)
 		ideal_idx = bg->current_idx;
 	}
 
-	if (ideal_idx > bg->current_idx)
+apply_step:
+	if (ideal_idx > bg->current_idx) {
 		bg->current_idx++;
-	else if (ideal_idx < bg->current_idx)
+		need_step = true;
+	} else if (ideal_idx < bg->current_idx) {
 		bg->current_idx--;
+		need_step = true;
+	}
 
 	if (ascending) {
 		if (bg->current_idx < min_idx)
@@ -266,26 +246,7 @@ apply_qos:
 		dev_pm_qos_update_request(&bg->qos_max_req, freq / 1000);
 	}
 
-	if (gpu_control_boost()) {
-		atomic_set(&bg->time_left_ms, 0);
-		atomic_set(&bg->event_count, 0);
-		bg->last_polling_ms = 0;
-		goto out_unlock;
-	}
-
-	{
-		int new_time_left = atomic_sub_return(next_poll, &bg->time_left_ms);
-		if (new_time_left <= 0) {
-			atomic_set(&bg->time_left_ms, 0);
-			atomic_set(&bg->event_count, 0);
-			bg->last_polling_ms = 0;
-		} else {
-			bg->last_polling_ms = next_poll;
-		}
-	}
-
-reschedule:
-	if (atomic_read(&bg->time_left_ms) > 0)
+	if (need_step && !bg->suspended)
 		queue_delayed_work(system_freezable_wq, &bg->work, msecs_to_jiffies(next_poll));
 
 out_unlock:
@@ -304,19 +265,13 @@ static int gpu_control_bl_notifier(struct notifier_block *nb, unsigned long even
 		mutex_lock(&bg->lock);
 		bg->suspended = true;
 		bg->target_freq = bg->hw_min_freq;
-		if (bg->qos_active) {
+		if (bg->qos_active && bg->enabled) {
 			dev_pm_qos_update_request(&bg->qos_min_req, bg->target_freq / 1000);
 			dev_pm_qos_update_request(&bg->qos_max_req, bg->target_freq / 1000);
 		}
 		mutex_unlock(&bg->lock);
-	} else if (bg->suspended) {
+	} else if (bg->suspended && bg->enabled) {
 		bg->suspended = false;
-		if (gpu_control_boost()) {
-			atomic_set(&bg->time_left_ms, 0);
-			atomic_set(&bg->event_count, 0);
-		} else {
-			gpu_control_grant_life(bg);
-		}
 		mod_delayed_work(system_freezable_wq, &bg->work, 0);
 	}
 	return NOTIFY_OK;
@@ -331,7 +286,7 @@ static int gpu_control_pm_notifier(struct notifier_block *nb, unsigned long even
 		mutex_lock(&bg->lock);
 		bg->suspended = true;
 		bg->target_freq = bg->hw_min_freq;
-		if (bg->qos_active) {
+		if (bg->qos_active && bg->enabled) {
 			dev_pm_qos_update_request(&bg->qos_min_req, bg->target_freq / 1000);
 			dev_pm_qos_update_request(&bg->qos_max_req, bg->target_freq / 1000);
 		}
@@ -340,16 +295,35 @@ static int gpu_control_pm_notifier(struct notifier_block *nb, unsigned long even
 		break;
 	case PM_POST_SUSPEND:
 		bg->suspended = false;
-		if (gpu_control_boost()) {
-			atomic_set(&bg->time_left_ms, 0);
-			atomic_set(&bg->event_count, 0);
-		} else {
-			gpu_control_grant_life(bg);
-		}
-		queue_delayed_work(system_freezable_wq, &bg->work, 0);
+		if (bg->enabled)
+			queue_delayed_work(system_freezable_wq, &bg->work, 0);
 		break;
 	}
 	return NOTIFY_DONE;
+}
+
+static ssize_t bg_sched_enabled_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	if (!g_bg || !g_bg->init_complete)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", g_bg->enabled);
+}
+
+static ssize_t bg_sched_enabled_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (!g_bg || !g_bg->init_complete)
+		return -ENODEV;
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+
+	mutex_lock(&g_bg->lock);
+	g_bg->enabled = !!val;
+	mutex_unlock(&g_bg->lock);
+
+	mod_delayed_work(system_freezable_wq, &g_bg->work, 0);
+	return count;
 }
 
 static ssize_t max_limit_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -504,115 +478,11 @@ static ssize_t polling_ms_store(struct device *dev, struct device_attribute *att
 	return count;
 }
 
-static ssize_t max_life_ms_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	if (!g_bg || !g_bg->init_complete)
-		return -ENODEV;
-	return sprintf(buf, "%u\n", g_bg->max_life_ms);
-}
-
-static ssize_t max_life_ms_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	unsigned int val;
-
-	if (!g_bg || !g_bg->init_complete)
-		return -ENODEV;
-	if (kstrtouint(buf, 10, &val))
-		return -EINVAL;
-
-	mutex_lock(&g_bg->lock);
-	g_bg->max_life_ms = val;
-	mutex_unlock(&g_bg->lock);
-	return count;
-}
-
-static ssize_t wake_grant_ms_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	if (!g_bg || !g_bg->init_complete)
-		return -ENODEV;
-	return sprintf(buf, "%u\n", g_bg->wake_grant_ms);
-}
-
-static ssize_t wake_grant_ms_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	unsigned int val;
-
-	if (!g_bg || !g_bg->init_complete)
-		return -ENODEV;
-	if (kstrtouint(buf, 10, &val))
-		return -EINVAL;
-
-	mutex_lock(&g_bg->lock);
-	g_bg->wake_grant_ms = val;
-	mutex_unlock(&g_bg->lock);
-	return count;
-}
-
-static ssize_t initial_life_ms_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	if (!g_bg || !g_bg->init_complete)
-		return -ENODEV;
-	return sprintf(buf, "%u\n", g_bg->initial_life_ms);
-}
-
-static ssize_t initial_life_ms_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	unsigned int val;
-
-	if (!g_bg || !g_bg->init_complete)
-		return -ENODEV;
-	if (kstrtouint(buf, 10, &val))
-		return -EINVAL;
-
-	mutex_lock(&g_bg->lock);
-	g_bg->initial_life_ms = val;
-	mutex_unlock(&g_bg->lock);
-	return count;
-}
-
-static ssize_t event_buffer_size_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	if (!g_bg || !g_bg->init_complete)
-		return -ENODEV;
-	return sprintf(buf, "%u\n", g_bg->event_buffer_size);
-}
-
-static ssize_t event_buffer_size_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	unsigned int val;
-
-	if (!g_bg || !g_bg->init_complete)
-		return -ENODEV;
-	if (kstrtouint(buf, 10, &val))
-		return -EINVAL;
-	if (val < MIN_EVENT_BUFFER_SIZE)
-		val = MIN_EVENT_BUFFER_SIZE;
-
-	mutex_lock(&g_bg->lock);
-	g_bg->event_buffer_size = val;
-	mutex_unlock(&g_bg->lock);
-	return count;
-}
-
 static ssize_t current_load_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	if (!g_bg || !g_bg->init_complete)
 		return -ENODEV;
 	return sprintf(buf, "%lu\n", g_bg->last_load);
-}
-
-static ssize_t current_polling_ms_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	if (!g_bg || !g_bg->init_complete)
-		return -ENODEV;
-	return sprintf(buf, "%u\n", g_bg->last_polling_ms);
-}
-
-static ssize_t current_time_left_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	if (!g_bg || !g_bg->init_complete)
-		return -ENODEV;
-	return sprintf(buf, "%d\n", atomic_read(&g_bg->time_left_ms));
 }
 
 static ssize_t current_target_freq_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -622,35 +492,25 @@ static ssize_t current_target_freq_show(struct device *dev, struct device_attrib
 	return sprintf(buf, "%lu\n", g_bg->target_freq);
 }
 
+static DEVICE_ATTR_RW(bg_sched_enabled);
 static DEVICE_ATTR_RW(max_limit);
 static DEVICE_ATTR_RW(up_threshold);
 static DEVICE_ATTR_RW(down_threshold);
 static DEVICE_ATTR_RW(bend_shift);
 static DEVICE_ATTR_RW(dynamic_curve);
 static DEVICE_ATTR_RW(polling_ms);
-static DEVICE_ATTR_RW(max_life_ms);
-static DEVICE_ATTR_RW(wake_grant_ms);
-static DEVICE_ATTR_RW(initial_life_ms);
-static DEVICE_ATTR_RW(event_buffer_size);
 static DEVICE_ATTR_RO(current_load);
-static DEVICE_ATTR_RO(current_polling_ms);
-static DEVICE_ATTR_RO(current_time_left);
 static DEVICE_ATTR_RO(current_target_freq);
 
 static struct attribute *gpu_control_attrs[] = {
+	&dev_attr_bg_sched_enabled.attr,
 	&dev_attr_max_limit.attr,
 	&dev_attr_up_threshold.attr,
 	&dev_attr_down_threshold.attr,
 	&dev_attr_bend_shift.attr,
 	&dev_attr_dynamic_curve.attr,
 	&dev_attr_polling_ms.attr,
-	&dev_attr_max_life_ms.attr,
-	&dev_attr_wake_grant_ms.attr,
-	&dev_attr_initial_life_ms.attr,
-	&dev_attr_event_buffer_size.attr,
 	&dev_attr_current_load.attr,
-	&dev_attr_current_polling_ms.attr,
-	&dev_attr_current_time_left.attr,
 	&dev_attr_current_target_freq.attr,
 	NULL,
 };
@@ -729,10 +589,7 @@ static void gpu_control_init_work(struct work_struct *work)
 	g_bg->bend_shift = DEFAULT_BEND_SHIFT;
 	g_bg->dynamic_curve_scale = DEFAULT_DYNAMIC_CURVE_SCALE;
 	g_bg->polling_ms = DEFAULT_POLLING_MS;
-	g_bg->max_life_ms = DEFAULT_MAX_LIFE_MS;
-	g_bg->wake_grant_ms = DEFAULT_WAKE_GRANT_MS;
-	g_bg->initial_life_ms = DEFAULT_INITIAL_LIFE_MS;
-	g_bg->event_buffer_size = DEFAULT_EVENT_BUFFER_SIZE;
+	g_bg->enabled = true;
 
 	if (df->profile && df->profile->freq_table && df->profile->max_state > 0) {
 		ft = df->profile->freq_table;
@@ -774,9 +631,6 @@ static void gpu_control_init_work(struct work_struct *work)
 
 	g_bg->max_mode_nb.notifier_call = gpu_max_mode_notifier;
 	atomic_notifier_chain_register(&hosterr_max_mode_notifier_list, &g_bg->max_mode_nb);
-
-	atomic_set(&g_bg->time_left_ms, g_bg->initial_life_ms);
-	atomic_set(&g_bg->event_count, g_bg->event_buffer_size);
 
 	INIT_DELAYED_WORK(&g_bg->work, gpu_control_work);
 	queue_delayed_work(system_freezable_wq, &g_bg->work, 0);

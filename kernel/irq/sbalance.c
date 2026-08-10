@@ -30,6 +30,7 @@
 #include <linux/freezer.h>
 #include <linux/irq.h>
 #include <linux/list_sort.h>
+#include <linux/string.h>
 #include "../sched/sched.h"
 #include "internals.h"
 
@@ -244,6 +245,44 @@ static bool find_min_bd(const cpumask_t *mask, unsigned int max_intrs,
 	return max_intrs - min_intrs < max(thresh, 1U);
 }
 
+static bool sbalance_is_movable(struct irq_desc *desc)
+{
+	struct irqaction *act;
+	unsigned long flags;
+	bool movable = true;
+	if (!__irq_can_set_affinity(desc))
+		return false;
+	raw_spin_lock_irqsave(&desc->lock, flags);
+	if (irqd_affinity_is_managed(&desc->irq_data)) {
+		movable = false;
+		goto unlock;
+	}
+	if (desc->irq_data.chip && desc->irq_data.chip->name &&
+	    strcmp(desc->irq_data.chip->name, "msmgpio") == 0) {
+		movable = false;
+		goto unlock;
+	}
+	for (act = desc->action; act; act = act->next) {
+		if (act->name) {
+			if (strstr(act->name, "fts") ||
+			    strstr(act->name, "touch") ||
+			    strstr(act->name, "panel") ||
+			    strstr(act->name, "esd") ||
+			    strstr(act->name, "goodix") ||
+			    strstr(act->name, "gf") ||
+			    strstr(act->name, "nfc") ||
+			    strstr(act->name, "pci0_wlan") ||
+			    strstr(act->name, "mhi")) {
+				movable = false;
+				goto unlock;
+			}
+		}
+	}
+unlock:
+	raw_spin_unlock_irqrestore(&desc->lock, flags);
+	return movable;
+}
+
 static void balance_irqs(void)
 {
 	static cpumask_t cpus;
@@ -296,7 +335,7 @@ static void balance_irqs(void)
 		bd->intrs += bi->delta_nr;
 
 		/* Consider this IRQ for balancing if it's movable */
-		if (!__irq_can_set_affinity(bi->desc))
+		if (!sbalance_is_movable(bi->desc))
 			continue;
 
 		/* Ignore for this balancing run if something else moved it */
