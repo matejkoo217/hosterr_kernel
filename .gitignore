@@ -9,6 +9,9 @@
 # any tracked files which get ignored after the change.
 #
 # Normal rules (sorted alphabetically)
+# --- local build driver + artifacts (keep out of git) ---
+/run.sh
+/output/
 #
 .*
 *.a
