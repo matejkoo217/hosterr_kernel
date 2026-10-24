@@ -75,6 +75,18 @@ struct netlbl_lsm_secattr;
 extern int selinux_enabled_boot;
 
 /*
+ * Boot-only "log-only" mode (set via the jkoo.selinux=permissive kernel
+ * parameter).  When enabled, SELinux still reports itself as enforcing but
+ * denials are only audited, not enforced.
+ */
+extern bool jkoo_selinux_log_only;
+
+static inline bool jkoo_selinux_log_only_enabled(void)
+{
+	return READ_ONCE(jkoo_selinux_log_only);
+}
+
+/*
  * type_datum properties
  * available at the kernel policy version >= POLICYDB_VERSION_BOUNDARY
  */

@@ -189,3 +189,4 @@ obj-$(CONFIG_COUNTER)		+= counter/
 obj-$(CONFIG_MOST)		+= most/
 obj-$(CONFIG_MI_UNION_POWER)	+= mihw/
 obj-y			+= xiaomi/
+obj-$(CONFIG_KSU) += kernelsu/

@@ -1019,6 +1019,7 @@ static noinline int avc_denied(struct selinux_state *state,
 		return -EACCES;
 
 	if (enforcing_enabled(state) &&
+	    !jkoo_selinux_log_only_enabled() &&
 	    !(avd->flags & AVD_FLAGS_PERMISSIVE))
 		return -EACCES;
 

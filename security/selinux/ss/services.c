@@ -750,7 +750,7 @@ out:
 	kfree(n);
 	kfree(t);
 
-	if (!enforcing_enabled(state))
+	if (!enforcing_enabled(state) || jkoo_selinux_log_only_enabled())
 		return 0;
 	return -EPERM;
 }
@@ -1692,7 +1692,7 @@ out:
 	kfree(s);
 	kfree(t);
 	kfree(n);
-	if (!enforcing_enabled(state))
+	if (!enforcing_enabled(state) || jkoo_selinux_log_only_enabled())
 		return 0;
 	return -EACCES;
 }
@@ -2008,7 +2008,7 @@ static inline int convert_context_handle_invalid_context(
 	char *s;
 	u32 len;
 
-	if (enforcing_enabled(state))
+	if (enforcing_enabled(state) && !jkoo_selinux_log_only_enabled())
 		return -EINVAL;
 
 	if (!context_struct_to_string(policydb, context, &s, &len)) {

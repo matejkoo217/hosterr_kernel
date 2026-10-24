@@ -152,6 +152,29 @@ static int __init checkreqprot_setup(char *str)
 }
 __setup("checkreqprot=", checkreqprot_setup);
 
+/*
+ * jkoo.selinux=permissive
+ *
+ * Log-only mode: AVC denials are audited exactly as usual (including
+ * "permissive=1") but are not enforced.  Unlike enforcing=0, the kernel still
+ * reports enforcing=1 via /sys/fs/selinux/enforce and the mmap status page.
+ * Boot-only; jkoo.selinux=enforcing (or no parameter) keeps normal behavior.
+ */
+bool jkoo_selinux_log_only __ro_after_init;
+
+static int __init jkoo_selinux_setup(char *str)
+{
+	if (!strcmp(str, "permissive"))
+		jkoo_selinux_log_only = true;
+	else if (!strcmp(str, "enforcing"))
+		jkoo_selinux_log_only = false;
+	else
+		pr_warn("SELinux:  unknown jkoo.selinux=%s (use permissive|enforcing)\n",
+			str);
+	return 1;
+}
+__setup("jkoo.selinux=", jkoo_selinux_setup);
+
 /**
  * selinux_secmark_enabled - Check to see if SECMARK is currently enabled
  *
@@ -6097,6 +6120,7 @@ static int selinux_netlink_send(struct sock *sk, struct sk_buff *skb)
 				secclass_map[sclass - 1].name,
 				task_pid_nr(current), current->comm);
 			if (enforcing_enabled(&selinux_state) &&
+			    !jkoo_selinux_log_only_enabled() &&
 			    !security_get_allow_unknown(&selinux_state))
 				return rc;
 			rc = 0;
@@ -7485,6 +7509,9 @@ static __init int selinux_init(void)
 		pr_debug("SELinux:  Starting in enforcing mode\n");
 	else
 		pr_debug("SELinux:  Starting in permissive mode\n");
+
+	if (jkoo_selinux_log_only)
+		pr_info("SELinux:  jkoo.selinux=permissive: auditing denials without enforcing (reporting enforcing)\n");
 
 	fs_validate_description("selinux", selinux_fs_parameters);
 
