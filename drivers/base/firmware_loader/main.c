@@ -479,6 +479,10 @@ static const char * const fw_path[] = {
 	fw_path_para[7],
 	fw_path_para[8],
 	fw_path_para[9],
+	/* HarmonyOS: subsystem images (adsp, modem, cdsp, venus...) from the
+	 * firmware partition, mounted by the vendor fstab */
+	"/vendor/firmware_mnt/image",
+	"/vendor/dsp",
 	"/lib/firmware/updates/" UTS_RELEASE,
 	"/lib/firmware/updates",
 	"/lib/firmware/" UTS_RELEASE,
