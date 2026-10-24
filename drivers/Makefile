@@ -177,6 +177,7 @@ obj-y				+= hwtracing/intel_th/
 obj-$(CONFIG_STM)		+= hwtracing/stm/
 obj-$(CONFIG_ANDROID)		+= android/
 obj-$(CONFIG_ACCESS_TOKENID)	+= accesstokenid/
+obj-$(CONFIG_OHOS_NFC_SYSFS)	+= ohos/
 obj-$(CONFIG_NVMEM)		+= nvmem/
 obj-$(CONFIG_FPGA)		+= fpga/
 obj-$(CONFIG_FSI)		+= fsi/

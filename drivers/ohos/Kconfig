@@ -53,4 +53,12 @@ config OHOS_MEMCG_FILES
 	  ... in /dev/memcg and refuses to start when one of the files is
 	  missing.  Store the values and read them back; nothing acts on them.
 
+config OHOS_NFC_SYSFS
+	bool "Provide /sys/nfc attributes for the HarmonyOS NFC stack"
+	default n
+	help
+	  Huawei's NFC HAL reads its chip type, device node and configuration
+	  file names from /sys/nfc.  Export the same attributes as plain
+	  values so the NXP HAL can drive an nq-nci controller.
+
 endmenu

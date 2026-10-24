@@ -34,6 +34,8 @@ CONFIG_TMPFS=y
 CONFIG_OHOS_FSVERITY_STUB=y
 # /dev/memcg files HarmonyOS memmgrservice writes at init
 CONFIG_OHOS_MEMCG_FILES=y
+# /sys/nfc attributes for Huawei's NFC HAL (used with nq-nci)
+CONFIG_OHOS_NFC_SYSFS=y
 # OHOS init creates /dev/binder from uevents; binderfs would hide the misc devices
 # CONFIG_ANDROID_BINDERFS is not set
 CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
