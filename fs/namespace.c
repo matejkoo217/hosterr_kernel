@@ -3562,6 +3562,103 @@ struct dentry *mount_subtree(struct vfsmount *m, const char *name)
 }
 EXPORT_SYMBOL(mount_subtree);
 
+#ifdef CONFIG_OHOS_FS_EMU
+/*
+ * HarmonyOS storage_daemon mounts "hmdfs" (distributed fs) and "sharefs" on
+ * every user start.  This kernel has neither, so emulate the local-only
+ * behaviour with what exists:
+ *   hmdfs  src -> dst : tmpfs on dst with device_view/local, merge_view and
+ *                       cloud_merge_view, each a bind mount of src
+ *   sharefs src -> dst: bind mount of src
+ */
+static int ohos_fs_emu_mkdir(const char *path)
+{
+	struct path parent;
+	struct dentry *dentry;
+	int ret;
+
+	dentry = kern_path_create(AT_FDCWD, path, &parent, LOOKUP_DIRECTORY);
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
+	ret = vfs_mkdir(mnt_user_ns(parent.mnt), d_inode(parent.dentry),
+			dentry, 0711);
+	done_path_create(&parent, dentry);
+	if (ret == -EEXIST)
+		ret = 0;
+	return ret;
+}
+
+static long ohos_fs_emu_mount(const char *dev, const char *dir,
+			      const char *type, unsigned long flags)
+{
+	static const char * const views[] = {
+		"device_view/local", "merge_view", "cloud_merge_view",
+	};
+	struct path path, view_path;
+	char *p;
+	long ret;
+	int i;
+
+	if (!dev || !*dev || !dir)
+		return -EINVAL;
+
+	p = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+
+	ret = kern_path(dir, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &path);
+	if (ret)
+		goto out;
+
+	if (!strcmp(type, "sharefs")) {
+		ret = path_mount(dev, &path, NULL, MS_BIND, NULL);
+		goto out_path;
+	}
+
+	{
+		/* path_mount() NUL-terminates data at PAGE_SIZE-1: needs a full page */
+		char *opts = (char *)get_zeroed_page(GFP_KERNEL);
+
+		if (!opts) {
+			ret = -ENOMEM;
+			goto out_path;
+		}
+		strlcpy(opts, "mode=0711", PAGE_SIZE);
+		ret = path_mount("hmdfs", &path, "tmpfs",
+				 flags & (MS_NOSUID | MS_NODEV | MS_NOEXEC), opts);
+		free_page((unsigned long)opts);
+	}
+	if (ret)
+		goto out_path;
+
+	snprintf(p, PATH_MAX, "%s/device_view", dir);
+	ret = ohos_fs_emu_mkdir(p);
+	if (ret)
+		goto out_path;
+
+	for (i = 0; i < ARRAY_SIZE(views); i++) {
+		snprintf(p, PATH_MAX, "%s/%s", dir, views[i]);
+		ret = ohos_fs_emu_mkdir(p);
+		if (ret)
+			break;
+		ret = kern_path(p, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &view_path);
+		if (ret)
+			break;
+		ret = path_mount(dev, &view_path, NULL, MS_BIND, NULL);
+		path_put(&view_path);
+		if (ret)
+			break;
+	}
+out_path:
+	path_put(&path);
+out:
+	if (ret)
+		pr_warn("ohos_fs_emu: %s %s -> %s failed %ld\n", type, dev, dir, ret);
+	kfree(p);
+	return ret;
+}
+#endif
+
 SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 		char __user *, type, unsigned long, flags, void __user *, data)
 {
@@ -3585,8 +3682,23 @@ SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 	if (IS_ERR(options))
 		goto out_data;
 
+#ifdef CONFIG_OHOS_FS_EMU
+	if (kernel_type && kernel_dev && !(flags & (MS_REMOUNT | MS_BIND)) &&
+	    (!strcmp(kernel_type, "hmdfs") || !strcmp(kernel_type, "sharefs"))) {
+		char *kernel_dir = strndup_user(dir_name, PATH_MAX);
+
+		if (IS_ERR(kernel_dir)) {
+			ret = PTR_ERR(kernel_dir);
+			goto out_options;
+		}
+		ret = ohos_fs_emu_mount(kernel_dev, kernel_dir, kernel_type, flags);
+		kfree(kernel_dir);
+		goto out_options;
+	}
+#endif
 	ret = do_mount(kernel_dev, dir_name, kernel_type, flags, options);
 
+out_options:
 	kfree(options);
 out_data:
 	kfree(kernel_dev);

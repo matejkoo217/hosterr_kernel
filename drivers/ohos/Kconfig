@@ -29,4 +29,11 @@ config OHOS_DRM_AUTH_ALL
 	  node through PRIME. There is no Android-style authenticator, so
 	  treat every client as authenticated.  KMS still requires DRM master.
 
+config OHOS_FS_EMU
+	bool "Emulate hmdfs/sharefs mounts with tmpfs + bind mounts"
+	default n
+	help
+	  HarmonyOS storage_daemon needs the hmdfs and sharefs filesystems to
+	  start a user.  Emulate their local (non-distributed) views.
+
 endmenu
