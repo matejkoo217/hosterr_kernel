@@ -19,4 +19,14 @@ config OHOS_BRINGUP_PERMISSIVE
 	depends on SECURITY_SELINUX_DEVELOP
 	default n
 
+config OHOS_DRM_AUTH_ALL
+	bool "Treat every DRM client as authenticated (HarmonyOS display HALs)"
+	depends on DRM
+	default n
+	help
+	  The HarmonyOS allocator host, composer host and render_service are
+	  separate non-root processes that share buffers on the primary DRM
+	  node through PRIME. There is no Android-style authenticator, so
+	  treat every client as authenticated.  KMS still requires DRM master.
+
 endmenu

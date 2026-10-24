@@ -25,6 +25,8 @@ CONFIG_PSTORE_PMSG=y
 CONFIG_PSTORE_RAM=y
 CONFIG_OHOS_BRINGUP_NOREBOOT=y
 CONFIG_OHOS_BRINGUP_PERMISSIVE=y
+# display HALs (allocator/composer/Mesa) share buffers on /dev/dri/card0
+CONFIG_OHOS_DRM_AUTH_ALL=y
 # OHOS init creates /dev/binder from uevents; binderfs would hide the misc devices
 # CONFIG_ANDROID_BINDERFS is not set
 CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
