@@ -383,6 +383,8 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		panic("cannot halt");
 
 	case LINUX_REBOOT_CMD_POWER_OFF:
+		pr_emerg("hmos: power off requested by %s[%d]\n",
+			 current->comm, task_pid_nr(current));
 		kernel_power_off();
 		do_exit(0);
 		break;
@@ -396,13 +398,23 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		buffer[sizeof(buffer) - 1] = '\0';
 
 #ifdef CONFIG_OHOS_BRINGUP_NOREBOOT
-		if (hmos_noreboot && !strcmp(buffer, "panic")) {
-			pr_emerg("hmos: refusing reboot(\"panic\") from %s[%d] (hmos.noreboot=1)\n",
-				 current->comm, task_pid_nr(current));
+		/* HarmonyOS init also uses "panic:<reason>" */
+		if (hmos_noreboot && strstr(buffer, "panic")) {
+			pr_emerg("hmos: refusing reboot(\"%s\") from %s[%d] (hmos.noreboot=1)\n",
+				 buffer, current->comm, task_pid_nr(current));
 			ret = -EPERM;
 			break;
 		}
 #endif
+		pr_emerg("hmos: reboot(\"%s\") requested by %s[%d]\n", buffer,
+			 current->comm, task_pid_nr(current));
+		/* HarmonyOS asks for "shutdown"/"poweroff" through RESTART2 on
+		 * some paths */
+		if (!strncmp(buffer, "shutdown", 8) ||
+		    !strncmp(buffer, "poweroff", 8)) {
+			kernel_power_off();
+			do_exit(0);
+		}
 		kernel_restart(buffer);
 		break;
 
