@@ -2143,6 +2143,17 @@ void dm_interface_exit(void)
  * @name: Buffer (size DM_NAME_LEN) for name
  * @uuid: Buffer (size DM_UUID_LEN) for uuid or empty string if uuid not defined
  */
+#ifdef CONFIG_OHOS_DM_PARTNAME
+int dm_disk_partname(struct gendisk *disk, char *name)
+{
+	struct mapped_device *md = disk->private_data;
+
+	if (!md)
+		return -ENODEV;
+	return dm_copy_name_and_uuid(md, name, NULL);
+}
+#endif
+
 int dm_copy_name_and_uuid(struct mapped_device *md, char *name, char *uuid)
 {
 	int r = 0;

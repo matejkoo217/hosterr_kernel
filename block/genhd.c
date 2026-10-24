@@ -1154,11 +1154,31 @@ static char *block_devnode(struct device *dev, umode_t *mode,
 	return NULL;
 }
 
+#ifdef CONFIG_OHOS_DM_PARTNAME
+extern int dm_disk_partname(struct gendisk *disk, char *name);
+
+static int disk_partname_uevent(struct device *dev, struct kobj_uevent_env *env)
+{
+	struct gendisk *disk = dev_to_disk(dev);
+	char name[128]; /* DM_NAME_LEN */
+
+	if (strncmp(disk->disk_name, "dm-", 3))
+		return 0;
+	name[0] = 0;
+	if (!dm_disk_partname(disk, name) && name[0])
+		add_uevent_var(env, "PARTNAME=%s", name);
+	return 0;
+}
+#endif
+
 const struct device_type disk_type = {
 	.name		= "disk",
 	.groups		= disk_attr_groups,
 	.release	= disk_release,
 	.devnode	= block_devnode,
+#ifdef CONFIG_OHOS_DM_PARTNAME
+	.uevent		= disk_partname_uevent,
+#endif
 };
 
 #ifdef CONFIG_PROC_FS

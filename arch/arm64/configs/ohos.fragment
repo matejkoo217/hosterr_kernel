@@ -1,0 +1,30 @@
+# HarmonyOS / OpenHarmony userspace on fuxi (SM8550, android13-5.15)
+#
+# Merge into an existing GKI config:
+#   scripts/kconfig/merge_config.sh -O out out/.config arch/arm64/configs/ohos.fragment
+#   make O=out ARCH=arm64 olddefconfig
+CONFIG_ACCESS_TOKENID=y
+CONFIG_BINDER_SENDER_INFO=y
+# OHOS init matches the dm-N devices by name (hmos-preinit writes fstab);
+# PARTNAME uevents are only needed when it has to create /dev/block/by-name
+# CONFIG_OHOS_DM_PARTNAME is not set
+CONFIG_DM_UEVENT=y
+CONFIG_BLK_DEV_DM=y
+CONFIG_EROFS_FS=y
+CONFIG_F2FS_FS=y
+CONFIG_SECURITY_SELINUX_DEVELOP=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_MEMCG=y
+# HarmonyOS mounts devtmpfs itself, the kernel must not mount /dev
+CONFIG_DEVTMPFS=y
+# CONFIG_DEVTMPFS_MOUNT is not set
+# persistent logs for bring-up (read back from recovery: /sys/fs/pstore)
+CONFIG_PSTORE=y
+CONFIG_PSTORE_CONSOLE=y
+CONFIG_PSTORE_PMSG=y
+CONFIG_PSTORE_RAM=y
+CONFIG_OHOS_BRINGUP_NOREBOOT=y
+CONFIG_OHOS_BRINGUP_PERMISSIVE=y
+# OHOS init creates /dev/binder from uevents; binderfs would hide the misc devices
+# CONFIG_ANDROID_BINDERFS is not set
+CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"

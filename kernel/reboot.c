@@ -313,6 +313,22 @@ DEFINE_MUTEX(system_transition_mutex);
  *
  * reboot doesn't sync: do that yourself before calling this.
  */
+#ifdef CONFIG_OHOS_BRINGUP_NOREBOOT
+/*
+ * HarmonyOS init reboots with reason "panic" when a "critical" service
+ * keeps crashing. During hardware bring-up that turns every missing driver
+ * into a reboot loop; with hmos.noreboot=1 on the command line the request
+ * is refused and logged so the system stays up for debugging.
+ */
+bool hmos_noreboot;
+static int __init hmos_noreboot_setup(char *str)
+{
+	hmos_noreboot = (str && *str == '1');
+	return 1;
+}
+__setup("hmos.noreboot=", hmos_noreboot_setup);
+#endif
+
 SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		void __user *, arg)
 {
@@ -379,6 +395,14 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		}
 		buffer[sizeof(buffer) - 1] = '\0';
 
+#ifdef CONFIG_OHOS_BRINGUP_NOREBOOT
+		if (hmos_noreboot && !strcmp(buffer, "panic")) {
+			pr_emerg("hmos: refusing reboot(\"panic\") from %s[%d] (hmos.noreboot=1)\n",
+				 current->comm, task_pid_nr(current));
+			ret = -EPERM;
+			break;
+		}
+#endif
 		kernel_restart(buffer);
 		break;
 

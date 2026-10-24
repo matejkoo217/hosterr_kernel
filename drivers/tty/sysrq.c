@@ -1165,6 +1165,18 @@ static ssize_t write_sysrq_trigger(struct file *file, const char __user *buf,
 
 		if (get_user(c, buf))
 			return -EFAULT;
+#ifdef CONFIG_OHOS_BRINGUP_NOREBOOT
+		{
+			extern bool hmos_noreboot;
+
+			/* HarmonyOS init "panics" by writing 'c' here */
+			if (hmos_noreboot && (c == 'c' || c == 'b' || c == 'o')) {
+				pr_emerg("hmos: refusing sysrq '%c' from %s[%d] (hmos.noreboot=1)\n",
+					 c, current->comm, task_pid_nr(current));
+				return count;
+			}
+		}
+#endif
 		__handle_sysrq(c, false);
 	}
 
