@@ -3455,6 +3455,13 @@ static void binder_transaction(struct binder_proc *proc,
 		t->from = thread;
 	else
 		t->from = NULL;
+#ifdef CONFIG_BINDER_SENDER_INFO
+	/* OpenHarmony: one-way transactions still report the sender pid */
+	if (!reply && (tr->flags & TF_ONE_WAY)) {
+		t->async_from_pid = current->tgid;
+		t->async_from_tid = current->pid;
+	}
+#endif
 	t->sender_euid = task_euid(proc->tsk);
 #ifdef CONFIG_ACCESS_TOKENID
 	t->sender_tokenid = current->token;
@@ -5177,11 +5184,13 @@ skip:
 #endif
 			trace_android_vh_sync_txn_recvd(thread->task, t_from->task);
 		} else {
-			trd->sender_pid = 0;
 #ifdef CONFIG_BINDER_SENDER_INFO
+			trd->sender_pid = t->async_from_pid;
 			binder_inner_proc_lock(thread->proc);
-			thread->sender_pid_nr = 0;
+			thread->sender_pid_nr = t->async_from_pid;
 			binder_inner_proc_unlock(thread->proc);
+#else
+			trd->sender_pid = 0;
 #endif
 		}
 
