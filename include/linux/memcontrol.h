@@ -235,8 +235,18 @@ struct obj_cgroup {
  * statistics based on the statistics developed by Rik Van Riel for clock-pro,
  * to help the administrator determine what knobs to tune.
  */
+#ifdef CONFIG_OHOS_MEMCG_FILES
+#define HMOS_MEMCG_NVALS 24
+#endif
 struct mem_cgroup {
 	struct cgroup_subsys_state css;
+
+#ifdef CONFIG_OHOS_MEMCG_FILES
+	/* HarmonyOS memmgr knobs (hyperhold/zswapd memcg files): accepted and
+	 * remembered so that memmgrservice can start, no reclaim behind them */
+	char hmos_name[64];
+	u64 hmos_vals[HMOS_MEMCG_NVALS];
+#endif
 
 	/* Private memcg ID. Used to ID objects that outlive the cgroup */
 	struct mem_cgroup_id id;

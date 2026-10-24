@@ -32,6 +32,8 @@ CONFIG_OHOS_FS_EMU=y
 CONFIG_TMPFS=y
 # installd code signing on a kernel without code-sign enforcement
 CONFIG_OHOS_FSVERITY_STUB=y
+# /dev/memcg files HarmonyOS memmgrservice writes at init
+CONFIG_OHOS_MEMCG_FILES=y
 # OHOS init creates /dev/binder from uevents; binderfs would hide the misc devices
 # CONFIG_ANDROID_BINDERFS is not set
 CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"

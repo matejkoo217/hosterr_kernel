@@ -44,4 +44,13 @@ config OHOS_FSVERITY_STUB
 	  kernel without fs-verity or code-sign enforcement.  No integrity is
 	  enforced.
 
+config OHOS_MEMCG_FILES
+	bool "Accept the HarmonyOS memmgr hyperhold/zswapd memcg files"
+	depends on MEMCG
+	default n
+	help
+	  memmgrservice writes memory.name, memory.app_score, memory.zswapd_*
+	  ... in /dev/memcg and refuses to start when one of the files is
+	  missing.  Store the values and read them back; nothing acts on them.
+
 endmenu
