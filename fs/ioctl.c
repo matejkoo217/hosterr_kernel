@@ -779,6 +779,30 @@ static int do_vfs_ioctl(struct file *filp, unsigned int fd,
 	void __user *argp = (void __user *)arg;
 	struct inode *inode = file_inode(filp);
 
+#ifdef CONFIG_OHOS_FSVERITY_STUB
+	/*
+	 * HarmonyOS installd enables fs-verity / code signing on every native
+	 * library it installs and aborts the install when that fails.  Accept
+	 * FS_IOC_ENABLE_VERITY and FS_IOC_ENABLE_CODE_SIGN as no-ops (code
+	 * signing is not enforced on this kernel) ...
+	 */
+	if (_IOC_TYPE(cmd) == 'f' && _IOC_DIR(cmd) == _IOC_WRITE &&
+	    (_IOC_NR(cmd) == 133 || _IOC_NR(cmd) == 200) && S_ISREG(inode->i_mode))
+		return 0;
+	/* ... and report every regular file as verity-enabled (FS_VERITY_FL),
+	 * which is what installd checks after enabling */
+	if (cmd == FS_IOC_GETFLAGS && S_ISREG(inode->i_mode)) {
+		unsigned int flags;
+		int err;
+
+		err = vfs_ioctl(filp, cmd, arg);
+		if (!err && !get_user(flags, (unsigned int __user *)argp))
+			err = put_user(flags | FS_VERITY_FL,
+				       (unsigned int __user *)argp);
+		return err;
+	}
+#endif
+
 	switch (cmd) {
 	case FIOCLEX:
 		set_close_on_exec(fd, 1);

@@ -36,4 +36,12 @@ config OHOS_FS_EMU
 	  HarmonyOS storage_daemon needs the hmdfs and sharefs filesystems to
 	  start a user.  Emulate their local (non-distributed) views.
 
+config OHOS_FSVERITY_STUB
+	bool "Accept fs-verity / code-sign enable ioctls as no-ops"
+	default n
+	help
+	  Lets HarmonyOS installd install HAPs with native libraries on a
+	  kernel without fs-verity or code-sign enforcement.  No integrity is
+	  enforced.
+
 endmenu
