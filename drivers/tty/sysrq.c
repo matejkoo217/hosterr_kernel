@@ -34,6 +34,7 @@
 #include <linux/quotaops.h>
 #include <linux/perf_event.h>
 #include <linux/kernel.h>
+#include <linux/ohos.h>
 #include <linux/module.h>
 #include <linux/suspend.h>
 #include <linux/writeback.h>
@@ -1170,7 +1171,8 @@ static ssize_t write_sysrq_trigger(struct file *file, const char __user *buf,
 			extern bool hmos_noreboot;
 
 			/* HarmonyOS init "panics" by writing 'c' here */
-			if (hmos_noreboot && (c == 'c' || c == 'b' || c == 'o')) {
+			if (hmos_noreboot && !hmos_disabled(HMOS_OFF_NOREBOOT) &&
+			    (c == 'c' || c == 'b' || c == 'o')) {
 				pr_emerg("hmos: refusing sysrq '%c' from %s[%d] (hmos.noreboot=1)\n",
 					 c, current->comm, task_pid_nr(current));
 				return count;

@@ -17,6 +17,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/cred.h>
+#include <linux/ohos.h>
 #include "access_tokenid.h"
 
 DEFINE_RWLOCK(token_rwlock);
@@ -386,6 +387,11 @@ static struct miscdevice access_tokenid_device = {
 static int access_tokenid_init_module(void)
 {
 	int err;
+
+	if (hmos_disabled(HMOS_OFF_ACCESS_TOKEN)) {
+		pr_info("access_token_id: disabled by hmos.disable\n");
+		return 0;
+	}
 
 	err = misc_register(&access_tokenid_device);
 	if (err < 0) {

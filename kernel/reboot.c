@@ -17,6 +17,7 @@
 #include <linux/suspend.h>
 #include <linux/syscalls.h>
 #include <linux/syscore_ops.h>
+#include <linux/ohos.h>
 #include <linux/uaccess.h>
 
 #include <trace/hooks/reboot.h>
@@ -399,7 +400,8 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 
 #ifdef CONFIG_OHOS_BRINGUP_NOREBOOT
 		/* HarmonyOS init also uses "panic:<reason>" */
-		if (hmos_noreboot && strstr(buffer, "panic")) {
+		if (hmos_noreboot && !hmos_disabled(HMOS_OFF_NOREBOOT) &&
+		    strstr(buffer, "panic")) {
 			pr_emerg("hmos: refusing reboot(\"%s\") from %s[%d] (hmos.noreboot=1)\n",
 				 buffer, current->comm, task_pid_nr(current));
 			ret = -EPERM;

@@ -22,6 +22,7 @@
 #include <linux/mutex.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/ohos.h>
 
 #define VAL_LEN 128
 
@@ -131,6 +132,10 @@ static int __init ohos_nfc_sysfs_init(void)
 {
 	int ret;
 
+	if (hmos_disabled(HMOS_OFF_NFC)) {
+		pr_info("ohos_nfc: disabled by hmos.disable\n");
+		return 0;
+	}
 	nfc_kobj = kobject_create_and_add("nfc", NULL);
 	if (!nfc_kobj)
 		return -ENOMEM;

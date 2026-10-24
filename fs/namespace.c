@@ -35,6 +35,7 @@
 
 #include "pnode.h"
 #include "internal.h"
+#include <linux/ohos.h>
 #include <trace/hooks/blk.h>
 
 /* Maximum number of mounts in a mount namespace */
@@ -3683,7 +3684,8 @@ SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 		goto out_data;
 
 #ifdef CONFIG_OHOS_FS_EMU
-	if (kernel_type && kernel_dev && !(flags & (MS_REMOUNT | MS_BIND)) &&
+	if (!hmos_disabled(HMOS_OFF_FS_EMU) &&
+	    kernel_type && kernel_dev && !(flags & (MS_REMOUNT | MS_BIND)) &&
 	    (!strcmp(kernel_type, "hmdfs") || !strcmp(kernel_type, "sharefs"))) {
 		char *kernel_dir = strndup_user(dir_name, PATH_MAX);
 

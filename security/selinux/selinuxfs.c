@@ -20,6 +20,7 @@
 #include <linux/fs_context.h>
 #include <linux/mount.h>
 #include <linux/mutex.h>
+#include <linux/ohos.h>
 #include <linux/namei.h>
 #include <linux/init.h>
 #include <linux/string.h>
@@ -174,7 +175,8 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 
 	new_value = !!new_value;
 #ifdef CONFIG_OHOS_BRINGUP_PERMISSIVE
-	if (hmos_force_permissive && new_value) {
+	if (hmos_force_permissive && !hmos_disabled(HMOS_OFF_PERMISSIVE) &&
+	    new_value) {
 		pr_warn("hmos: ignoring setenforce 1 from %s (hmos.permissive=1)\n",
 			current->comm);
 		new_value = 0;

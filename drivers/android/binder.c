@@ -67,6 +67,7 @@
 #include <linux/task_work.h>
 #include <linux/sizes.h>
 #include <linux/android_vendor.h>
+#include <linux/ohos.h>
 
 #include <uapi/linux/sched/types.h>
 #include <uapi/linux/android/binder.h>
@@ -3457,7 +3458,7 @@ static void binder_transaction(struct binder_proc *proc,
 		t->from = NULL;
 #ifdef CONFIG_BINDER_SENDER_INFO
 	/* OpenHarmony: one-way transactions still report the sender pid */
-	if (!reply && (tr->flags & TF_ONE_WAY)) {
+	if (!hmos_disabled(HMOS_OFF_BINDER) && !reply && (tr->flags & TF_ONE_WAY)) {
 		t->async_from_pid = current->tgid;
 		t->async_from_tid = current->pid;
 	}
@@ -6005,6 +6006,11 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case BINDER_FEATURE_SET: {
 		struct binder_feature_set __user *features = ubuf;
 
+		if (hmos_disabled(HMOS_OFF_BINDER)) {
+			ret = -ENOTTY;
+			goto err;
+		}
+
 		if (size != sizeof(struct binder_feature_set)) {
 			ret = -EINVAL;
 			goto err;
@@ -6020,6 +6026,11 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case BINDER_GET_ACCESS_TOKEN: {
 		struct access_token __user *tokens = ubuf;
 		u64 token, ftoken;
+
+		if (hmos_disabled(HMOS_OFF_BINDER)) {
+			ret = -ENOTTY;
+			goto err;
+		}
 
 		if (size != sizeof(struct access_token)) {
 			ret = -EINVAL;
@@ -6041,6 +6052,11 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case BINDER_GET_SENDER_INFO: {
 		struct binder_sender_info __user *sender = ubuf;
 		u64 token = 0, ftoken = 0, sender_pid_nr;
+
+		if (hmos_disabled(HMOS_OFF_BINDER)) {
+			ret = -ENOTTY;
+			goto err;
+		}
 
 		if (size != sizeof(struct binder_sender_info)) {
 			ret = -EINVAL;

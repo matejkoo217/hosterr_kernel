@@ -45,6 +45,7 @@
 #include <linux/rbtree.h>
 #include <linux/slab.h>
 #include <linux/swap.h>
+#include <linux/ohos.h>
 #include <linux/swapops.h>
 #include <linux/spinlock.h>
 #include <linux/eventfd.h>
@@ -7366,7 +7367,7 @@ int __init mem_cgroup_init(void)
 	int cpu, node;
 
 #ifdef CONFIG_OHOS_MEMCG_FILES
-	if (!mem_cgroup_disabled())
+	if (!mem_cgroup_disabled() && !hmos_disabled(HMOS_OFF_MEMCG))
 		WARN_ON(cgroup_add_legacy_cftypes(&memory_cgrp_subsys,
 						  hmos_memcg_files));
 #endif

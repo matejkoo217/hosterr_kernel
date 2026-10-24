@@ -42,6 +42,7 @@
 #include <drm/drm_client.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
+#include <linux/ohos.h>
 #include <drm/drm_print.h>
 
 #include "drm_crtc_internal.h"
@@ -173,7 +174,8 @@ struct drm_file *drm_file_alloc(struct drm_minor *minor)
 	 * primary node through PRIME; there is no Android-style authenticator, so
 	 * treat every client as authenticated.  KMS still requires DRM master.
 	 */
-	file->authenticated = 1;
+	if (!hmos_disabled(HMOS_OFF_DRM_AUTH))
+		file->authenticated = 1;
 #endif
 
 	INIT_LIST_HEAD(&file->lhead);
