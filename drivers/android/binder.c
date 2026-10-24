@@ -77,6 +77,23 @@
 #include "binder_trace.h"
 #include <trace/hooks/binder.h>
 
+/*
+ * OpenHarmony binder extensions: which features this build provides,
+ * reported to userspace through BINDER_FEATURE_SET.
+ */
+#ifdef CONFIG_ACCESS_TOKENID
+#define ENABLE_ACCESS_TOKENID 1
+#else
+#define ENABLE_ACCESS_TOKENID 0
+#endif
+#ifdef CONFIG_BINDER_SENDER_INFO
+#define ENABLE_BINDER_SENDER_INFO 1
+#else
+#define ENABLE_BINDER_SENDER_INFO 0
+#endif
+#define BINDER_CURRENT_FEATURE_SET \
+	((ENABLE_ACCESS_TOKENID << 0) | (ENABLE_BINDER_SENDER_INFO << 2))
+
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
 
@@ -3439,6 +3456,10 @@ static void binder_transaction(struct binder_proc *proc,
 	else
 		t->from = NULL;
 	t->sender_euid = task_euid(proc->tsk);
+#ifdef CONFIG_ACCESS_TOKENID
+	t->sender_tokenid = current->token;
+	t->first_tokenid = current->ftoken;
+#endif
 	t->to_proc = target_proc;
 	t->to_thread = target_thread;
 	t->code = tr->code;
@@ -5149,9 +5170,19 @@ skip:
 			trd->sender_pid =
 				task_tgid_nr_ns(sender,
 						task_active_pid_ns(current));
+#ifdef CONFIG_BINDER_SENDER_INFO
+			binder_inner_proc_lock(thread->proc);
+			thread->sender_pid_nr = task_tgid_nr(sender);
+			binder_inner_proc_unlock(thread->proc);
+#endif
 			trace_android_vh_sync_txn_recvd(thread->task, t_from->task);
 		} else {
 			trd->sender_pid = 0;
+#ifdef CONFIG_BINDER_SENDER_INFO
+			binder_inner_proc_lock(thread->proc);
+			thread->sender_pid_nr = 0;
+			binder_inner_proc_unlock(thread->proc);
+#endif
 		}
 
 		ret = binder_apply_fd_fixups(proc, t);
@@ -5233,6 +5264,12 @@ skip:
 		if (t_from)
 			binder_thread_dec_tmpref(t_from);
 		t->buffer->allow_user_free = 1;
+#ifdef CONFIG_ACCESS_TOKENID
+		binder_inner_proc_lock(thread->proc);
+		thread->tokens.sender_tokenid = t->sender_tokenid;
+		thread->tokens.first_tokenid = t->first_tokenid;
+		binder_inner_proc_unlock(thread->proc);
+#endif
 		if (cmd != BR_REPLY && !(t->flags & TF_ONE_WAY)) {
 			binder_inner_proc_lock(thread->proc);
 			t->to_parent = thread->transaction_stack;
@@ -5956,6 +5993,66 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 		break;
 	}
+	case BINDER_FEATURE_SET: {
+		struct binder_feature_set __user *features = ubuf;
+
+		if (size != sizeof(struct binder_feature_set)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		if (put_user((__u64)BINDER_CURRENT_FEATURE_SET,
+			     &features->feature_set)) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
+#ifdef CONFIG_ACCESS_TOKENID
+	case BINDER_GET_ACCESS_TOKEN: {
+		struct access_token __user *tokens = ubuf;
+		u64 token, ftoken;
+
+		if (size != sizeof(struct access_token)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		binder_inner_proc_lock(proc);
+		token = thread->tokens.sender_tokenid;
+		ftoken = thread->tokens.first_tokenid;
+		binder_inner_proc_unlock(proc);
+		if (put_user(token, &tokens->sender_tokenid) ||
+		    put_user(ftoken, &tokens->first_tokenid)) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
+#endif
+#ifdef CONFIG_BINDER_SENDER_INFO
+	case BINDER_GET_SENDER_INFO: {
+		struct binder_sender_info __user *sender = ubuf;
+		u64 token = 0, ftoken = 0, sender_pid_nr;
+
+		if (size != sizeof(struct binder_sender_info)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		binder_inner_proc_lock(proc);
+#ifdef CONFIG_ACCESS_TOKENID
+		token = thread->tokens.sender_tokenid;
+		ftoken = thread->tokens.first_tokenid;
+#endif
+		sender_pid_nr = thread->sender_pid_nr;
+		binder_inner_proc_unlock(proc);
+		if (put_user(token, &sender->tokens.sender_tokenid) ||
+		    put_user(ftoken, &sender->tokens.first_tokenid) ||
+		    put_user(sender_pid_nr, &sender->sender_pid_nr)) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
+#endif
 	case BINDER_GET_NODE_INFO_FOR_REF: {
 		struct binder_node_info_for_ref info;
 

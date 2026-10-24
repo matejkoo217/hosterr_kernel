@@ -559,6 +559,12 @@ struct binder_thread {
 	spinlock_t prio_lock;
 	struct binder_priority prio_next;
 	enum binder_prio_state prio_state;
+#ifdef CONFIG_ACCESS_TOKENID
+	struct access_token tokens;
+#endif
+#ifdef CONFIG_BINDER_SENDER_INFO
+	__u64 sender_pid_nr;
+#endif
 };
 
 /**
@@ -607,6 +613,16 @@ struct binder_transaction {
 	 */
 	spinlock_t lock;
 	ANDROID_VENDOR_DATA(1);
+#ifdef CONFIG_ACCESS_TOKENID
+	u64 sender_tokenid;
+	u64 first_tokenid;
+#endif
+#ifdef CONFIG_BINDER_SENDER_INFO
+	/* OpenHarmony: one-way transactions still report the sender pid
+	 * (render_service, samgr... check it for async calls too) */
+	pid_t async_from_pid;
+	pid_t async_from_tid;
+#endif
 };
 
 /**

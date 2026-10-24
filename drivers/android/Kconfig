@@ -116,6 +116,15 @@ config ANDROID_VENDOR_OEM_DATA
 
 	  If even slightly unsure, say Y.
 
+config BINDER_SENDER_INFO
+	bool "OpenHarmony: binder sender info ioctl"
+	depends on ANDROID_BINDER_IPC
+	default n
+	help
+	  Adds BINDER_GET_ACCESS_TOKEN / BINDER_GET_SENDER_INFO, which the
+	  OpenHarmony userspace (samgr, render_service, ...) uses to identify
+	  the caller of a transaction.
+
 endif # if ANDROID
 
 endmenu
