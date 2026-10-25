@@ -238,8 +238,17 @@ drm_master_check_perm(struct drm_device *dev, struct drm_file *file_priv)
 	if (file_priv->pid == task_pid(current) && file_priv->was_master)
 		return 0;
 
+#ifndef CONFIG_OHOS_DRM_AUTH_ALL
 	if (!capable(CAP_SYS_ADMIN))
 		return -EACCES;
+#else
+	/*
+	 * HarmonyOS: SET_MASTER/DROP_MASTER are the hand-over points between
+	 * composer_host and render_service, neither of which is root; allow
+	 * them for any client.  Only a free master can be taken (checked in
+	 * drm_setmaster_ioctl), so this cannot steal master from a live owner.
+	 */
+#endif
 
 	return 0;
 }

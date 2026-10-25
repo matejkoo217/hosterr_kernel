@@ -4986,6 +4986,98 @@ out_kfree:
 	return ret;
 }
 
+/*
+ * HarmonyOS memmgrservice configures the hyperhold/zswapd extensions of the
+ * OpenHarmony kernel through extra memcg files (memory.name,
+ * memory.app_score, memory.zswapd_*, ...). When one of those writes fails its
+ * init fails, it never publishes SA 1909, and every client (SceneBoard on
+ * each window occlusion change) then blocks ~1.2 s waiting for it. Provide
+ * the files: values are stored and read back, nothing acts on them.
+ */
+static int hmos_memcg_name_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
+
+	seq_printf(m, "%s\n", memcg->hmos_name);
+	return 0;
+}
+
+static ssize_t hmos_memcg_name_write(struct kernfs_open_file *of, char *buf,
+				     size_t nbytes, loff_t off)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+
+	strscpy(memcg->hmos_name, strstrip(buf), sizeof(memcg->hmos_name));
+	return nbytes;
+}
+
+static int hmos_memcg_val_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
+	unsigned int i = seq_cft(m)->private;
+
+	seq_printf(m, "%llu\n", i < HMOS_MEMCG_NVALS ? memcg->hmos_vals[i] : 0);
+	return 0;
+}
+
+static ssize_t hmos_memcg_val_write(struct kernfs_open_file *of, char *buf,
+				    size_t nbytes, loff_t off)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+	unsigned int i = of_cft(of)->private;
+	unsigned long long v = 0;
+
+	/* multi-value params ("0 0 50") keep their first number */
+	if (sscanf(strstrip(buf), "%llu", &v) < 1)
+		v = 0;
+	if (i < HMOS_MEMCG_NVALS)
+		memcg->hmos_vals[i] = v;
+	return nbytes;
+}
+
+static int hmos_memcg_info_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
+
+	seq_printf(m, "memcg score: %llu\nmemcg ub_mem2zram_ratio: %llu\n"
+		   "memcg ub_zram2ufs_ratio: %llu\nmemcg refault_threshold: %llu\n",
+		   memcg->hmos_vals[0], memcg->hmos_vals[1], memcg->hmos_vals[2],
+		   memcg->hmos_vals[3]);
+	return 0;
+}
+
+#define HMOS_MEMCG_VAL(n, idx) { .name = n, .private = idx, \
+	.seq_show = hmos_memcg_val_show, .write = hmos_memcg_val_write }
+
+static struct cftype hmos_memcg_files[] = {
+	{ .name = "name", .seq_show = hmos_memcg_name_show,
+	  .write = hmos_memcg_name_write },
+	HMOS_MEMCG_VAL("app_score", 0),
+	HMOS_MEMCG_VAL("ub_ufs2zram_ratio", 4),
+	HMOS_MEMCG_VAL("force_swapin", 5),
+	HMOS_MEMCG_VAL("force_swapout", 6),
+	HMOS_MEMCG_VAL("force_shrink_all", 7),
+	HMOS_MEMCG_VAL("force_shrink_anon", 8),
+	HMOS_MEMCG_VAL("force_shrink_purgeable_bysize", 9),
+	HMOS_MEMCG_VAL("force_soft_limit_reclaim", 10),
+	HMOS_MEMCG_VAL("gpu_reclaimed", 11),
+	HMOS_MEMCG_VAL("soft_limit_param", 12),
+	HMOS_MEMCG_VAL("swap_full_ratio", 13),
+	HMOS_MEMCG_VAL("zram_wm_ratio", 14),
+	HMOS_MEMCG_VAL("zswapd_memcgs_param", 15),
+	HMOS_MEMCG_VAL("avail_buffers", 16),
+	HMOS_MEMCG_VAL("zswapd_pressure", 17),
+	HMOS_MEMCG_VAL("zswapd_presure_show", 18),
+	HMOS_MEMCG_VAL("psi_health_info", 19),
+	HMOS_MEMCG_VAL("eswap_info", 20),
+	HMOS_MEMCG_VAL("space_info", 21),
+	HMOS_MEMCG_VAL("total_info_per_app", 22),
+	HMOS_MEMCG_VAL("zswapd_max_reclaim_size", 23),
+	{ .name = "zswapd_single_memcg_param", .seq_show = hmos_memcg_info_show,
+	  .write = hmos_memcg_val_write, .private = 1 },
+	{ }	/* terminate */
+};
+
 static struct cftype mem_cgroup_legacy_files[] = {
 	{
 		.name = "usage_in_bytes",
@@ -7260,6 +7352,16 @@ __setup("cgroup.memory=", cgroup_memory);
 static int __init mem_cgroup_init(void)
 {
 	int cpu, node;
+
+	/*
+	 * HarmonyOS memmgrservice needs these on the v1 memory hierarchy
+	 * (/dev/memcg) before it can start; see hmos_memcg_files[].  Safe
+	 * here: cgroup_init() already ran from start_kernel() and registered
+	 * the subsystem, so the legacy cftypes end up on every v1 mount.
+	 */
+	if (!mem_cgroup_disabled())
+		WARN_ON(cgroup_add_legacy_cftypes(&memory_cgrp_subsys,
+						  hmos_memcg_files));
 
 	/*
 	 * Currently s32 type (can refer to struct batched_lruvec_stat) is

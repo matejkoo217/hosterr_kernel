@@ -542,6 +542,18 @@ int drm_version(struct drm_device *dev, void *data,
  */
 int drm_ioctl_permit(u32 flags, struct drm_file *file_priv)
 {
+#ifdef CONFIG_OHOS_DRM_AUTH_ALL
+	/*
+	 * HarmonyOS: the composer host, the allocator host and render_service
+	 * are independent non-root processes sharing /dev/dri/card0 and no
+	 * single one of them stays DRM master for the lifetime of the others.
+	 * Drop the MASTER requirement so those paths work without holding
+	 * master; the handlers keep their own consistency checks.  Bring-up
+	 * only, default n.
+	 */
+	flags &= ~DRM_MASTER;
+#endif
+
 	/* ROOT_ONLY is only for CAP_SYS_ADMIN */
 	if (unlikely((flags & DRM_ROOT_ONLY) && !capable(CAP_SYS_ADMIN)))
 		return -EACCES;

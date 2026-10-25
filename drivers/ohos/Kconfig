@@ -19,6 +19,21 @@ config OHOS_BRINGUP_PERMISSIVE
 	depends on SECURITY_SELINUX_DEVELOP
 	default n
 
+config OHOS_DRM_AUTH_ALL
+	bool "Let unprivileged HarmonyOS display HALs share /dev/dri/card0"
+	depends on DRM
+	default n
+	help
+	  HarmonyOS composer_host, allocator_host and render_service are
+	  separate non-root processes that share the primary DRM node through
+	  PRIME and hand DRM master between each other, without an Android
+	  style authenticator.  This marks every DRM client as authenticated
+	  and drops the DRM_MASTER requirement from the ioctl permission
+	  check, so those processes can drive card0 without holding master.
+
+	  This weakens DRM access control for all clients of the node; only
+	  enable it while bringing up the HarmonyOS userspace.
+
 config OHOS_FS_EMU
 	bool "Emulate hmdfs/sharefs mounts with tmpfs + bind mounts"
 	depends on TMPFS

@@ -28,3 +28,4 @@ CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
 CONFIG_OHOS_FS_EMU=y
 # installd installs HAPs with native libs by enabling fs-verity; accept it
 CONFIG_OHOS_FSVERITY_STUB=y
+CONFIG_OHOS_DRM_AUTH_ALL=y

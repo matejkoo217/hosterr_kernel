@@ -479,6 +479,15 @@ static const char * const fw_path[] = {
 	fw_path_para[7],
 	fw_path_para[8],
 	fw_path_para[9],
+	/*
+	 * HarmonyOS (and Android) asks for the subsystem images (adsp, cdsp,
+	 * modem, venus, wlan ...) that live on the dedicated modem/dsp
+	 * partitions; the vendor fstab mounts them at these paths.  The
+	 * configured firmware_class.path (fw_path_para[], /vendor/firmware on
+	 * fuxi) is searched first, these are extra fallbacks.
+	 */
+	"/vendor/firmware_mnt/image",
+	"/vendor/dsp",
 	"/lib/firmware/updates/" UTS_RELEASE,
 	"/lib/firmware/updates",
 	"/lib/firmware/" UTS_RELEASE,

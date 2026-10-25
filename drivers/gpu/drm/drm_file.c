@@ -166,6 +166,17 @@ struct drm_file *drm_file_alloc(struct drm_minor *minor)
 
 	/* for compatibility root is always authenticated */
 	file->authenticated = capable(CAP_SYS_ADMIN);
+#ifdef CONFIG_OHOS_DRM_AUTH_ALL
+	/*
+	 * HarmonyOS: composer_host, allocator_host and render_service (Mesa
+	 * kms_swrast) are separate non-root processes that share PRIME buffers
+	 * on the primary node, and HarmonyOS has no Android-style
+	 * authenticator (no DRM_IOCTL_AUTH_MAGIC dance); treat every client as
+	 * authenticated.  KMS ownership is still governed by the DRM master
+	 * rules.
+	 */
+	file->authenticated = true;
+#endif
 
 	INIT_LIST_HEAD(&file->lhead);
 	INIT_LIST_HEAD(&file->fbs);

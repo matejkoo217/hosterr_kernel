@@ -197,6 +197,12 @@ struct memcg_padding {
 #endif
 
 /*
+ * Number of HarmonyOS memmgr hyperhold/zswapd values remembered per memcg
+ * (see the memcg files added in mm/memcontrol.c).
+ */
+#define HMOS_MEMCG_NVALS 24
+
+/*
  * Remember four most recent foreign writebacks with dirty pages in this
  * cgroup.  Inode sharing is expected to be uncommon and, even if we miss
  * one in a given round, we're likely to catch it later if it keeps
@@ -237,6 +243,13 @@ struct obj_cgroup {
  */
 struct mem_cgroup {
 	struct cgroup_subsys_state css;
+
+	/*
+	 * HarmonyOS memmgr knobs (hyperhold/zswapd memcg files): accepted and
+	 * remembered so that memmgrservice can start, no reclaim behind them.
+	 */
+	char hmos_name[64];
+	u64 hmos_vals[HMOS_MEMCG_NVALS];
 
 	/* Private memcg ID. Used to ID objects that outlive the cgroup */
 	struct mem_cgroup_id id;
