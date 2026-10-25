@@ -320,7 +320,7 @@ DEFINE_MUTEX(system_transition_mutex);
  * into a reboot loop; with hmos.noreboot=1 on the command line the request
  * is refused and logged so the system stays up for debugging.
  */
-static bool hmos_noreboot;
+bool hmos_noreboot; /* read by drivers/tty/sysrq.c as well */
 static int __init hmos_noreboot_setup(char *str)
 {
 	hmos_noreboot = (str && *str == '1');

@@ -1164,12 +1164,13 @@ EXPORT_SYMBOL(unregister_sysrq_key);
  * them may be honoured: the port must never reboot on its own (a spontaneous
  * reset is indistinguishable from a failed boot and loses the log).
  *
- * hmos_noreboot and its "hmos.noreboot=" __setup handler belong to the
- * kernel/reboot.c part of the bring-up series.  The __weak definition keeps
- * this file linkable on its own; if reboot.c defines it, the strong
- * definition wins and both users share the same variable.
+ * hmos_noreboot and its "hmos.noreboot=" __setup handler live in
+ * kernel/reboot.c (part of the same series).  It must be that one global:
+ * a __weak definition here would give sysrq its own zero-initialised copy,
+ * the __setup handler would write reboot.c's copy, and hmos.noreboot=1
+ * would silently never arm this check.
  */
-bool __weak hmos_noreboot;
+extern bool hmos_noreboot;
 
 static bool hmos_sysrq_refused(char c)
 {
