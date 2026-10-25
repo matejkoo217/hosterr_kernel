@@ -133,10 +133,11 @@ static bool check_permission_for_set_token_permission(void)
 
 static void add_node_to_left_tree_tail(struct token_perm_node *root_node, struct token_perm_node *node)
 {
+	struct token_perm_node *current_node = root_node;
+
 	if ((root_node == NULL) || (node == NULL))
 		return;
 
-	struct token_perm_node *current_node = root_node;
 	while (true) {
 		if (current_node->left == NULL) {
 			current_node->left = node;
@@ -149,9 +150,10 @@ static void add_node_to_left_tree_tail(struct token_perm_node *root_node, struct
 static void find_node_by_token(struct token_perm_node *root_node, uint32_t token,
 	struct token_perm_node **target_node, struct token_perm_node **parent_node)
 {
+	struct token_perm_node *current_node = root_node;
+
 	*target_node = NULL;
 	*parent_node = NULL;
-	struct token_perm_node *current_node = root_node;
 	while (current_node != NULL) {
 		if (current_node->perm_data.token == token) {
 			*target_node = current_node;
@@ -168,12 +170,13 @@ static void find_node_by_token(struct token_perm_node *root_node, uint32_t token
 
 static int add_node_to_tree(struct token_perm_node **root_node, struct token_perm_node *node)
 {
+	struct token_perm_node *target_node = NULL;
+	struct token_perm_node *parent_node = NULL;
+
 	if (root_node == NULL) {
 		pr_err("%s: invalid root_node.\n", __func__);
 		return -EINVAL;
 	}
-	struct token_perm_node *target_node = NULL;
-	struct token_perm_node *parent_node = NULL;
 	find_node_by_token(*root_node, node->perm_data.token, &target_node, &parent_node);
 	if (target_node != NULL) {
 		target_node->perm_data = node->perm_data;
@@ -196,19 +199,20 @@ static int add_node_to_tree(struct token_perm_node **root_node, struct token_per
 
 static struct token_perm_node *remove_node_by_token(struct token_perm_node **root_node, uint32_t token)
 {
+	struct token_perm_node *target_node = NULL;
+	struct token_perm_node *parent_node = NULL;
+	struct token_perm_node **new_node_addr = NULL;
+
 	if (root_node == NULL) {
 		pr_err("%s: invalid root_node.\n", __func__);
 		return NULL;
 	}
-	struct token_perm_node *target_node = NULL;
-	struct token_perm_node *parent_node = NULL;
 	find_node_by_token(*root_node, token, &target_node, &parent_node);
 	if (target_node == NULL) {
 		pr_err("%s: target token to be removed not found.\n", __func__);
 		return NULL;
 	}
 
-	struct token_perm_node **new_node_addr = NULL;
 	if (parent_node == NULL) {
 		new_node_addr = root_node;
 	} else if (parent_node->perm_data.token > token) {
@@ -228,10 +232,13 @@ static struct token_perm_node *remove_node_by_token(struct token_perm_node **roo
 
 int access_tokenid_add_permission(struct file *file, void __user *uarg)
 {
+	struct token_perm_node *node;
+	int ret;
+
 	if (!check_permission_for_set_token_permission())
 		return -EPERM;
 
-	struct token_perm_node *node = kmem_cache_zalloc(g_cache, GFP_KERNEL);
+	node = kmem_cache_zalloc(g_cache, GFP_KERNEL);
 	if (node == NULL)
 		return -ENOMEM;
 	if (copy_from_user(&(node->perm_data), uarg, sizeof(ioctl_add_perm_data))) {
@@ -240,7 +247,7 @@ int access_tokenid_add_permission(struct file *file, void __user *uarg)
 	}
 
 	write_lock(&token_rwlock);
-	int ret = add_node_to_tree(&g_token_perm_root, node);
+	ret = add_node_to_tree(&g_token_perm_root, node);
 	write_unlock(&token_rwlock);
 	if (ret <= 0) {
 		kmem_cache_free(g_cache, node);
@@ -251,15 +258,17 @@ int access_tokenid_add_permission(struct file *file, void __user *uarg)
 
 int access_tokenid_remove_permission(struct file *file, void __user *uarg)
 {
+	uint32_t token = 0;
+	struct token_perm_node *target_node;
+
 	if (!check_permission_for_set_token_permission())
 		return -EPERM;
 
-	uint32_t token = 0;
 	if (copy_from_user(&token, uarg, sizeof(token)))
 		return -EFAULT;
 
 	write_lock(&token_rwlock);
-	struct token_perm_node *target_node = remove_node_by_token(&g_token_perm_root, token);
+	target_node = remove_node_by_token(&g_token_perm_root, token);
 	if (target_node != NULL)
 		kmem_cache_free(g_cache, target_node);
 	write_unlock(&token_rwlock);
@@ -269,21 +278,23 @@ int access_tokenid_remove_permission(struct file *file, void __user *uarg)
 
 int access_tokenid_set_permission(struct file *file, void __user *uarg)
 {
+	ioctl_set_get_perm_data set_perm_data;
+	struct token_perm_node *target_node = NULL;
+	struct token_perm_node *parent_node = NULL;
+	uint32_t idx, bit_idx;
+
 	if (!check_permission_for_set_token_permission())
 		return -EPERM;
 
-	ioctl_set_get_perm_data set_perm_data;
 	if (copy_from_user(&set_perm_data, uarg, sizeof(set_perm_data)))
 		return -EFAULT;
 
-	uint32_t idx = set_perm_data.op_code / UINT32_T_BITS;
+	idx = set_perm_data.op_code / UINT32_T_BITS;
 	if (idx >= MAX_PERM_GROUP_NUM) {
 		pr_err("%s: invalid op_code.\n", __func__);
 		return -EINVAL;
 	}
 
-	struct token_perm_node *target_node = NULL;
-	struct token_perm_node *parent_node = NULL;
 	write_lock(&token_rwlock);
 	find_node_by_token(g_token_perm_root, set_perm_data.token, &target_node, &parent_node);
 	if (target_node == NULL) {
@@ -291,7 +302,7 @@ int access_tokenid_set_permission(struct file *file, void __user *uarg)
 		pr_err("%s: token not found.\n", __func__);
 		return -ENODATA;
 	}
-	uint32_t bit_idx = set_perm_data.op_code % UINT32_T_BITS;
+	bit_idx = set_perm_data.op_code % UINT32_T_BITS;
 	if (set_perm_data.is_granted) {
 		target_node->perm_data.perm[idx] |= (uint32_t)0x01 << bit_idx;
 	} else {
@@ -304,17 +315,20 @@ int access_tokenid_set_permission(struct file *file, void __user *uarg)
 int access_tokenid_get_permission(struct file *file, void __user *uarg)
 {
 	ioctl_set_get_perm_data get_perm_data;
+	struct token_perm_node *target_node = NULL;
+	struct token_perm_node *parent_node = NULL;
+	uint32_t idx, bit_idx;
+	int ret;
+
 	if (copy_from_user(&get_perm_data, uarg, sizeof(get_perm_data)))
 		return -EFAULT;
 
-	uint32_t idx = get_perm_data.op_code / UINT32_T_BITS;
+	idx = get_perm_data.op_code / UINT32_T_BITS;
 	if (idx >= MAX_PERM_GROUP_NUM) {
 		pr_err("%s: invalid op_code.\n", __func__);
 		return -EINVAL;
 	}
 
-	struct token_perm_node *target_node = NULL;
-	struct token_perm_node *parent_node = NULL;
 	read_lock(&token_rwlock);
 	find_node_by_token(g_token_perm_root, get_perm_data.token, &target_node, &parent_node);
 	if (target_node == NULL) {
@@ -322,8 +336,8 @@ int access_tokenid_get_permission(struct file *file, void __user *uarg)
 		return -ENODATA;
 	}
 
-	uint32_t bit_idx = get_perm_data.op_code % UINT32_T_BITS;
-	int ret = (target_node->perm_data.perm[idx] & ((uint32_t)0x01 << bit_idx)) >> bit_idx;
+	bit_idx = get_perm_data.op_code % UINT32_T_BITS;
+	ret = (target_node->perm_data.perm[idx] & ((uint32_t)0x01 << bit_idx)) >> bit_idx;
 	read_unlock(&token_rwlock);
 	return ret;
 }

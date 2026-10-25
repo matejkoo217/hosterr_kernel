@@ -3552,6 +3552,133 @@ struct dentry *mount_subtree(struct vfsmount *m, const char *name)
 }
 EXPORT_SYMBOL(mount_subtree);
 
+#ifdef CONFIG_OHOS_FS_EMU
+/*
+ * HarmonyOS storage_daemon mounts "hmdfs" (the distributed filesystem) and
+ * "sharefs" each time it starts a user.  Neither exists in this kernel, so
+ * emulate their local-only view with what does exist here:
+ *
+ *   hmdfs   src -> dst : tmpfs on dst with device_view/local, merge_view and
+ *                        cloud_merge_view, each a bind mount of src
+ *   sharefs src -> dst : bind mount of src
+ *
+ * The 4.14 version of this hack built user pointers for do_mount() and
+ * sys_mkdirat() and ran them under set_fs(KERNEL_DS).  5.15 has no set_fs()
+ * and its syscall helpers validate __user ranges, so every step below stays
+ * on kernel pointers: kern_path(), path_mount() (5.15's body of do_mount(),
+ * callable with a resolved struct path), do_loopback() (mount(2)'s own
+ * MS_BIND implementation) and vfs_mkdir().
+ */
+
+#define OHOS_FS_EMU_DIRMODE	0711
+
+static int ohos_fs_emu_mkdir(const char *name)
+{
+	struct dentry *dentry;
+	struct path path;
+	int err;
+
+	dentry = kern_path_create(AT_FDCWD, name, &path, 0);
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
+	err = vfs_mkdir(&init_user_ns, d_inode(path.dentry), dentry,
+			OHOS_FS_EMU_DIRMODE);
+	done_path_create(&path, dentry);
+	if (err == -EEXIST)
+		err = 0;
+	return err;
+}
+
+static int ohos_fs_emu_bind(const char *src, const char *dst)
+{
+	struct path path;
+	int err;
+
+	err = kern_path(dst, LOOKUP_FOLLOW, &path);
+	if (err)
+		return err;
+	/* do_loopback() is the mount(2) MS_BIND path, with a kernel-side name */
+	err = do_loopback(&path, src, 0);
+	path_put(&path);
+	return err;
+}
+
+static long ohos_fs_emu_mount(const char *dev, const char __user *udir,
+			      const char *type, unsigned long flags)
+{
+	static const char * const views[] = {
+		"device_view/local", "merge_view", "cloud_merge_view",
+	};
+	char *dir, *p, *opts;
+	struct path path;
+	int err, i;
+
+	dir = strndup_user(udir, PATH_MAX);
+	if (IS_ERR(dir))
+		return PTR_ERR(dir);
+	p = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!p) {
+		err = -ENOMEM;
+		goto out_dir;
+	}
+
+	err = kern_path(dir, LOOKUP_FOLLOW, &path);
+	if (err)
+		goto out;
+
+	if (!strcmp(type, "sharefs")) {
+		/* the local view of a share is the shared directory itself */
+		err = do_loopback(&path, dev, 0);
+		path_put(&path);
+		goto out;
+	}
+
+	/*
+	 * hmdfs: a tmpfs carrying the local views.  path_mount() NUL-terminates
+	 * data at PAGE_SIZE - 1, exactly like the legacy mount(2) path always
+	 * did, so the options must live in a full page, not in a string literal.
+	 */
+	opts = (char *)get_zeroed_page(GFP_KERNEL);
+	if (!opts) {
+		path_put(&path);
+		err = -ENOMEM;
+		goto out;
+	}
+	strscpy(opts, "mode=0711", PAGE_SIZE);
+	err = path_mount("hmdfs", &path, "tmpfs",
+			 flags & (MS_NOSUID | MS_NODEV | MS_NOEXEC), opts);
+	free_page((unsigned long)opts);
+	path_put(&path);
+	if (err)
+		goto out;
+
+	snprintf(p, PATH_MAX, "%s/device_view", dir);
+	err = ohos_fs_emu_mkdir(p);
+	if (err)
+		goto out;
+	for (i = 0; i < ARRAY_SIZE(views); i++) {
+		snprintf(p, PATH_MAX, "%s/%s", dir, views[i]);
+		err = ohos_fs_emu_mkdir(p);
+		if (err)
+			break;
+		err = ohos_fs_emu_bind(dev, p);
+		if (err) {
+			pr_warn("ohos_fs_emu: bind %s -> %s failed %d\n",
+				dev, p, err);
+			break;
+		}
+	}
+out:
+	if (err)
+		pr_warn("ohos_fs_emu: %s %s -> %s failed %d\n",
+			type, dev, dir, err);
+	kfree(p);
+out_dir:
+	kfree(dir);
+	return err;
+}
+#endif /* CONFIG_OHOS_FS_EMU */
+
 SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 		char __user *, type, unsigned long, flags, void __user *, data)
 {
@@ -3575,6 +3702,12 @@ SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 	if (IS_ERR(options))
 		goto out_data;
 
+#ifdef CONFIG_OHOS_FS_EMU
+	if (kernel_type && kernel_dev && !(flags & (MS_REMOUNT | MS_BIND)) &&
+	    (!strcmp(kernel_type, "hmdfs") || !strcmp(kernel_type, "sharefs")))
+		ret = ohos_fs_emu_mount(kernel_dev, dir_name, kernel_type, flags);
+	else
+#endif
 	ret = do_mount(kernel_dev, dir_name, kernel_type, flags, options);
 
 	kfree(options);

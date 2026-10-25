@@ -22,3 +22,9 @@ CONFIG_OHOS_BRINGUP_PERMISSIVE=y
 # OHOS init creates /dev/binder from uevents; binderfs would hide the misc devices
 # CONFIG_ANDROID_BINDERFS is not set
 CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
+
+# --- fuxi port additions -------------------------------------------------
+# hmdfs/sharefs emulation so storage_daemon can start a user
+CONFIG_OHOS_FS_EMU=y
+# installd installs HAPs with native libs by enabling fs-verity; accept it
+CONFIG_OHOS_FSVERITY_STUB=y

@@ -27,6 +27,12 @@
 
 #include <asm/ioctls.h>
 
+#ifdef CONFIG_OHOS_FSVERITY_STUB
+#include <uapi/linux/fsverity.h>
+/* OpenHarmony code-signing enable ioctl; not an upstream command */
+#define OHOS_FS_IOC_ENABLE_CODE_SIGN_NR	200
+#endif
+
 /* So that the fiemap access checks can't overflow on 32 bit machines. */
 #define FIEMAP_MAX_EXTENTS	(UINT_MAX / sizeof(struct fiemap_extent))
 
@@ -778,6 +784,41 @@ static int do_vfs_ioctl(struct file *filp, unsigned int fd,
 {
 	void __user *argp = (void __user *)arg;
 	struct inode *inode = file_inode(filp);
+
+#ifdef CONFIG_OHOS_FSVERITY_STUB
+	/*
+	 * HarmonyOS installd enables fs-verity / code signing on every native
+	 * library it installs and aborts the install when that fails.  This
+	 * kernel has no code-sign enforcement (XPM) and the filesystems here
+	 * are not configured for fs-verity, so accept the two "enable" ioctls
+	 * on regular files as no-ops: FS_IOC_ENABLE_VERITY ('f', 133) and
+	 * OpenHarmony's FS_IOC_ENABLE_CODE_SIGN ('f', 200).  No integrity is
+	 * enforced - this only makes the install succeed.
+	 */
+	if (_IOC_TYPE(cmd) == 'f' && _IOC_DIR(cmd) == _IOC_WRITE &&
+	    (_IOC_NR(cmd) == _IOC_NR(FS_IOC_ENABLE_VERITY) ||
+	     _IOC_NR(cmd) == OHOS_FS_IOC_ENABLE_CODE_SIGN_NR) &&
+	    S_ISREG(inode->i_mode))
+		return 0;
+
+	/*
+	 * ...and report every regular file as verity-enabled (FS_VERITY_FL),
+	 * which is what installd checks right after enabling it.  5.15 routes
+	 * FS_IOC_GETFLAGS through ioctl_getflags() -> vfs_fileattr_get(); keep
+	 * that path (and its errors, e.g. -ENOTTY on filesystems without
+	 * fileattr support) and only OR the flag into a successful result.
+	 */
+	if (cmd == FS_IOC_GETFLAGS && S_ISREG(inode->i_mode)) {
+		unsigned int flags;
+		int err;
+
+		err = ioctl_getflags(filp, (unsigned int __user *)argp);
+		if (!err && !get_user(flags, (unsigned int __user *)argp))
+			err = put_user(flags | FS_VERITY_FL,
+				       (unsigned int __user *)argp);
+		return err;
+	}
+#endif
 
 	switch (cmd) {
 	case FIOCLEX:

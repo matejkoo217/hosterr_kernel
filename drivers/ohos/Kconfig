@@ -19,4 +19,21 @@ config OHOS_BRINGUP_PERMISSIVE
 	depends on SECURITY_SELINUX_DEVELOP
 	default n
 
+config OHOS_FS_EMU
+	bool "Emulate hmdfs/sharefs mounts with tmpfs + bind mounts"
+	depends on TMPFS
+	default n
+	help
+	  HarmonyOS storage_daemon needs the hmdfs and sharefs filesystems
+	  in order to start a user.  Emulate their local (non-distributed)
+	  views with a tmpfs plus bind mounts so that mount() succeeds and
+	  the paths the daemon expects exist.
+
+config OHOS_FSVERITY_STUB
+	bool "Accept fs-verity / code-sign enable ioctls as no-ops"
+	default n
+	help
+	  Lets HarmonyOS installd install HAPs with native libraries on a
+	  kernel without fs-verity.  No integrity is enforced.
+
 endmenu
