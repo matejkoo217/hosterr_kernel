@@ -1157,6 +1157,29 @@ EXPORT_SYMBOL(unregister_sysrq_key);
 /*
  * writing 'C' to /proc/sysrq-trigger is like sysrq-C
  */
+#ifdef CONFIG_OHOS_BRINGUP_NOREBOOT
+/*
+ * HarmonyOS init "panics" by writing 'c' to /proc/sysrq-trigger, and 'b'/'o'
+ * reset or power off the phone just as well.  With hmos.noreboot=1 none of
+ * them may be honoured: the port must never reboot on its own (a spontaneous
+ * reset is indistinguishable from a failed boot and loses the log).
+ *
+ * hmos_noreboot and its "hmos.noreboot=" __setup handler belong to the
+ * kernel/reboot.c part of the bring-up series.  The __weak definition keeps
+ * this file linkable on its own; if reboot.c defines it, the strong
+ * definition wins and both users share the same variable.
+ */
+bool __weak hmos_noreboot;
+
+static bool hmos_sysrq_refused(char c)
+{
+	if (!hmos_noreboot)
+		return false;
+
+	return c == 'c' || c == 'b' || c == 'o';
+}
+#endif /* CONFIG_OHOS_BRINGUP_NOREBOOT */
+
 static ssize_t write_sysrq_trigger(struct file *file, const char __user *buf,
 				   size_t count, loff_t *ppos)
 {
@@ -1165,6 +1188,13 @@ static ssize_t write_sysrq_trigger(struct file *file, const char __user *buf,
 
 		if (get_user(c, buf))
 			return -EFAULT;
+#ifdef CONFIG_OHOS_BRINGUP_NOREBOOT
+		if (hmos_sysrq_refused(c)) {
+			pr_emerg("hmos: refusing sysrq '%c' from %s[%d] (hmos.noreboot=1)\n",
+				 c, current->comm, task_pid_nr(current));
+			return count;
+		}
+#endif
 		__handle_sysrq(c, false);
 	}
 

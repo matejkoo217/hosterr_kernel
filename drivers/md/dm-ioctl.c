@@ -2130,6 +2130,38 @@ void dm_interface_exit(void)
 	dm_hash_exit();
 }
 
+#ifdef CONFIG_OHOS_DM_PARTNAME
+/*
+ * Name accessor for block/genhd.c: the PARTNAME uevent variable of a dm disk.
+ * @disk is the gendisk of a "dm-<minor>" device, @name must be DM_NAME_LEN
+ * bytes.
+ *
+ * dm_device_name() cannot be used here: in 5.15 md->name holds the
+ * "major:minor" string formatted by alloc_dev(), not the mapped-device name.
+ * That name only lives in the hash_cell, so go through
+ * dm_copy_name_and_uuid().
+ */
+int dm_disk_partname(struct gendisk *disk, char *name)
+{
+	struct mapped_device *md = disk->private_data;
+	char dname[DM_NAME_LEN];
+	int r;
+
+	if (!md)
+		return -ENODEV;
+
+	dname[0] = '\0';
+	r = dm_copy_name_and_uuid(md, dname, NULL);
+	if (r)
+		return r;
+
+	/* strscpy() truncates instead of overflowing a short caller buffer */
+	strscpy(name, dname, DM_NAME_LEN);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dm_disk_partname);
+#endif /* CONFIG_OHOS_DM_PARTNAME */
+
 /**
  * dm_copy_name_and_uuid - Copy mapped device name & uuid into supplied buffers
  * @md: Pointer to mapped_device

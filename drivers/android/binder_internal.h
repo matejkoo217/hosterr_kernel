@@ -12,6 +12,7 @@
 #include <linux/stddef.h>
 #include <linux/types.h>
 #include <linux/uidgid.h>
+#include <uapi/linux/android/binder.h>
 #include <uapi/linux/android/binderfs.h>
 #include "binder_alloc.h"
 
@@ -533,6 +534,12 @@ struct binder_proc_wrap *proc_wrapper(struct binder_proc *proc)
  * @prio_state:           state of the priority restore process as
  *                        defined by enum binder_prio_state
  *                        (protected by @prio_lock)
+ * @tokens:               OpenHarmony access token of the last transaction
+ *                        this thread read from its todo list
+ *                        (protected by @proc->inner_lock)
+ * @sender_pid_nr:        OpenHarmony pid of the sender of the last
+ *                        transaction this thread read from its todo list
+ *                        (protected by @proc->inner_lock)
  *
  * Bookkeeping structure for binder threads.
  */
@@ -556,6 +563,18 @@ struct binder_thread {
 	spinlock_t prio_lock;
 	struct binder_priority prio_next;
 	enum binder_prio_state prio_state;
+#ifdef CONFIG_ACCESS_TOKENID
+	/*
+	 * OpenHarmony: access token of the last transaction this thread
+	 * read from its todo list, copied out of struct binder_transaction
+	 * so BINDER_GET_ACCESS_TOKEN can report it.
+	 */
+	struct access_token tokens;
+#endif
+#ifdef CONFIG_BINDER_SENDER_INFO
+	/* OpenHarmony: pid of the sender of that same transaction */
+	__u64 sender_pid_nr;
+#endif
 };
 
 /**
@@ -604,6 +623,23 @@ struct binder_transaction {
 	 */
 	spinlock_t lock;
 	ANDROID_VENDOR_DATA(1);
+#ifdef CONFIG_ACCESS_TOKENID
+	/*
+	 * OpenHarmony: token of the sending task (->token) and the token it
+	 * inherited at fork time (->ftoken), captured in binder_transaction()
+	 * and reported to the receiver by BINDER_GET_ACCESS_TOKEN.
+	 */
+	u64 sender_tokenid;
+	u64 first_tokenid;
+#endif
+#ifdef CONFIG_BINDER_SENDER_INFO
+	/*
+	 * OpenHarmony: pid of the sender of a one-way transaction.  @from is
+	 * always NULL for async calls, so the receiver cannot recover the
+	 * sender otherwise; render_service and samgr check it.
+	 */
+	pid_t async_from_pid;
+#endif
 };
 
 /**

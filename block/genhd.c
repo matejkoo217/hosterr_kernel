@@ -1132,11 +1132,59 @@ static void disk_release(struct device *dev)
 	iput(disk->part0->bd_inode);	/* frees the disk */
 }
 
+#ifdef CONFIG_OHOS_DM_PARTNAME
+/*
+ * OpenHarmony init (harmony mkswap/mount preinit) creates /dev/block/by-name
+ * links only from the PARTNAME uevent variable.  A device-mapper disk is
+ * called "dm-<minor>", which tells userspace nothing, so ask dm-ioctl for the
+ * mapped-device name (system, vendor, chip_prod, ...) and pass it on.
+ *
+ * Must match DM_NAME_LEN in include/uapi/linux/dm-ioctl.h.
+ */
+#define OHOS_DM_NAME_LEN	128
+
+extern int dm_disk_partname(struct gendisk *disk, char *name);
+
+static void ohos_dm_partname_uevent(struct gendisk *disk, struct device *dev,
+				    struct kobj_uevent_env *env)
+{
+	char name[OHOS_DM_NAME_LEN];
+
+	/*
+	 * The block class uevent runs for partitions as well; they get their
+	 * own PARTNAME from part_uevent() (volume label), and dm_disk_partname()
+	 * is only meaningful for the whole disk.
+	 */
+	if (dev != disk_to_dev(disk))
+		return;
+
+	if (strncmp(disk->disk_name, "dm-", 3))
+		return;
+
+	name[0] = '\0';
+	if (dm_disk_partname(disk, name) || !name[0])
+		return;
+
+	if (add_uevent_var(env, "PARTNAME=%s", name))
+		pr_warn("block: %s: uevent buffer too small for PARTNAME=%s\n",
+			disk->disk_name, name);
+}
+#endif /* CONFIG_OHOS_DM_PARTNAME */
+
 static int block_uevent(struct device *dev, struct kobj_uevent_env *env)
 {
 	struct gendisk *disk = dev_to_disk(dev);
+	int ret;
 
-	return add_uevent_var(env, "DISKSEQ=%llu", disk->diskseq);
+	ret = add_uevent_var(env, "DISKSEQ=%llu", disk->diskseq);
+	if (ret)
+		return ret;
+
+#ifdef CONFIG_OHOS_DM_PARTNAME
+	ohos_dm_partname_uevent(disk, dev, env);
+#endif
+
+	return 0;
 }
 
 struct class block_class = {

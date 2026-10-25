@@ -135,6 +135,22 @@ static ssize_t sel_read_enforce(struct file *filp, char __user *buf,
 }
 
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
+#ifdef CONFIG_OHOS_BRINGUP_PERMISSIVE
+/*
+ * hmos.permissive=1: keep SELinux permissive while the HarmonyOS userspace is
+ * brought up on hardware and with a policy that do not describe this device
+ * yet.  Any later "setenforce 1" is then ignored instead of restricting the
+ * system to a state that does not boot.
+ */
+static bool hmos_force_permissive;
+static int __init hmos_permissive_setup(char *str)
+{
+	hmos_force_permissive = (str && *str == '1');
+	return 1;
+}
+__setup("hmos.permissive=", hmos_permissive_setup);
+#endif /* CONFIG_OHOS_BRINGUP_PERMISSIVE */
+
 static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 				 size_t count, loff_t *ppos)
 
@@ -161,6 +177,14 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 		goto out;
 
 	new_value = !!new_value;
+
+#ifdef CONFIG_OHOS_BRINGUP_PERMISSIVE
+	if (hmos_force_permissive && new_value) {
+		pr_warn("hmos: ignoring setenforce 1 from %s (hmos.permissive=1)\n",
+			current->comm);
+		new_value = 0;
+	}
+#endif
 
 	old_value = enforcing_enabled(state);
 	if (new_value != old_value) {

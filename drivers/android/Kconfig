@@ -54,6 +54,19 @@ config ANDROID_BINDER_IPC_SELFTEST
 	  exhaustively with combinations of various buffer sizes and
 	  alignments.
 
+config BINDER_SENDER_INFO
+	bool "OpenHarmony: binder sender info ioctl"
+	depends on ANDROID_BINDER_IPC
+	default n
+	help
+	  Report the pid of the sender of the last transaction read by a
+	  thread, including one-way (async) transactions, through the
+	  BINDER_GET_SENDER_INFO ioctl.  Plain Linux binder reports 0 as
+	  BR_TRANSACTION sender_pid for async calls, which makes OpenHarmony
+	  services (render_service, samgr, ...) refuse the call.
+
+	  Only needed to run an OpenHarmony / HarmonyOS userspace.
+
 config ANDROID_DEBUG_SYMBOLS
 	bool "Android Debug Symbols"
 	help

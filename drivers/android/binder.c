@@ -77,6 +77,26 @@
 #include "binder_trace.h"
 #include <trace/hooks/binder.h>
 
+/*
+ * OpenHarmony: feature bits reported by BINDER_FEATURE_SET.  The bit
+ * positions are the ones OpenHarmony 5.0 userspace expects: bit 0 is the
+ * access token id support, bit 2 is the sender info ioctl.  Bit 1 is
+ * reserved (OHOS uses it for its own "enhanced" transaction data and this
+ * driver does not implement it).
+ */
+#ifdef CONFIG_ACCESS_TOKENID
+#define ENABLE_ACCESS_TOKENID 1
+#else
+#define ENABLE_ACCESS_TOKENID 0
+#endif
+#ifdef CONFIG_BINDER_SENDER_INFO
+#define ENABLE_BINDER_SENDER_INFO 1
+#else
+#define ENABLE_BINDER_SENDER_INFO 0
+#endif
+#define BINDER_CURRENT_FEATURE_SET \
+	((ENABLE_ACCESS_TOKENID << 0) | (ENABLE_BINDER_SENDER_INFO << 2))
+
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
 
@@ -3346,7 +3366,24 @@ static void binder_transaction(struct binder_proc *proc,
 		t->from = thread;
 	else
 		t->from = NULL;
+#ifdef CONFIG_BINDER_SENDER_INFO
+	/*
+	 * OpenHarmony: record who sent a one-way transaction, so
+	 * binder_thread_read() can report a meaningful sender_pid instead
+	 * of 0 for async calls.
+	 */
+	if (!reply && (tr->flags & TF_ONE_WAY))
+		t->async_from_pid = current->tgid;
+#endif
 	t->sender_euid = task_euid(proc->tsk);
+#ifdef CONFIG_ACCESS_TOKENID
+	/*
+	 * OpenHarmony: the receiver checks the caller's access token, so
+	 * capture it while we still run in the sender's context.
+	 */
+	t->sender_tokenid = current->token;
+	t->first_tokenid = current->ftoken;
+#endif
 	t->to_proc = target_proc;
 	t->to_thread = target_thread;
 	t->code = tr->code;
@@ -5057,9 +5094,25 @@ skip:
 			trd->sender_pid =
 				task_tgid_nr_ns(sender,
 						task_active_pid_ns(current));
+#ifdef CONFIG_BINDER_SENDER_INFO
+			binder_inner_proc_lock(proc);
+			thread->sender_pid_nr = task_tgid_nr(sender);
+			binder_inner_proc_unlock(proc);
+#endif
 			trace_android_vh_sync_txn_recvd(thread->task, t_from->task);
 		} else {
+#ifdef CONFIG_BINDER_SENDER_INFO
+			/*
+			 * OpenHarmony: one-way transactions have no t->from,
+			 * but the receiver still wants the sender pid.
+			 */
+			trd->sender_pid = t->async_from_pid;
+			binder_inner_proc_lock(proc);
+			thread->sender_pid_nr = t->async_from_pid;
+			binder_inner_proc_unlock(proc);
+#else
 			trd->sender_pid = 0;
+#endif
 		}
 
 		ret = binder_apply_fd_fixups(proc, t);
@@ -5141,6 +5194,18 @@ skip:
 		if (t_from)
 			binder_thread_dec_tmpref(t_from);
 		t->buffer->allow_user_free = 1;
+#ifdef CONFIG_ACCESS_TOKENID
+		/*
+		 * OpenHarmony: keep the sender's token for this thread so
+		 * BINDER_GET_ACCESS_TOKEN can report it after the
+		 * transaction itself has been handed out (or freed, for
+		 * one-way calls) below.
+		 */
+		binder_inner_proc_lock(proc);
+		thread->tokens.sender_tokenid = t->sender_tokenid;
+		thread->tokens.first_tokenid = t->first_tokenid;
+		binder_inner_proc_unlock(proc);
+#endif
 		if (cmd != BR_REPLY && !(t->flags & TF_ONE_WAY)) {
 			binder_inner_proc_lock(thread->proc);
 			t->to_parent = thread->transaction_stack;
@@ -5990,6 +6055,71 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		binder_inner_proc_unlock(proc);
 		break;
 	}
+	case BINDER_FEATURE_SET: {
+		struct binder_feature_set __user *features = ubuf;
+
+		if (size != sizeof(struct binder_feature_set)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		if (put_user((__u64)BINDER_CURRENT_FEATURE_SET,
+			     &features->feature_set)) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
+#ifdef CONFIG_ACCESS_TOKENID
+	case BINDER_GET_ACCESS_TOKEN: {
+		struct access_token __user *tokens = ubuf;
+		u64 sender_tokenid, first_tokenid;
+
+		if (size != sizeof(struct access_token)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		/*
+		 * The tokens belong to the last transaction this thread
+		 * read, not to the caller: a looper asks right after
+		 * BR_TRANSACTION while it still holds the sender's context.
+		 */
+		binder_inner_proc_lock(proc);
+		sender_tokenid = thread->tokens.sender_tokenid;
+		first_tokenid = thread->tokens.first_tokenid;
+		binder_inner_proc_unlock(proc);
+		if (put_user(sender_tokenid, &tokens->sender_tokenid) ||
+		    put_user(first_tokenid, &tokens->first_tokenid)) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
+#endif
+#ifdef CONFIG_BINDER_SENDER_INFO
+	case BINDER_GET_SENDER_INFO: {
+		struct binder_sender_info __user *sender = ubuf;
+		u64 sender_tokenid = 0, first_tokenid = 0, sender_pid_nr;
+
+		if (size != sizeof(struct binder_sender_info)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		binder_inner_proc_lock(proc);
+#ifdef CONFIG_ACCESS_TOKENID
+		sender_tokenid = thread->tokens.sender_tokenid;
+		first_tokenid = thread->tokens.first_tokenid;
+#endif
+		sender_pid_nr = thread->sender_pid_nr;
+		binder_inner_proc_unlock(proc);
+		if (put_user(sender_tokenid, &sender->tokens.sender_tokenid) ||
+		    put_user(first_tokenid, &sender->tokens.first_tokenid) ||
+		    put_user(sender_pid_nr, &sender->sender_pid_nr)) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
+#endif
 	default:
 		ret = -EINVAL;
 		goto err;
