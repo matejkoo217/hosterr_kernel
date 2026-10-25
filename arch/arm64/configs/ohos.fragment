@@ -1,0 +1,24 @@
+# HarmonyOS / OpenHarmony userspace on sweet (stage 1 bring-up)
+CONFIG_ACCESS_TOKENID=y
+CONFIG_BINDER_SENDER_INFO=y
+# CONFIG_OHOS_DM_PARTNAME is not set  (init matches dm-N by device name instead)
+CONFIG_DM_UEVENT=y
+CONFIG_BLK_DEV_DM=y
+CONFIG_EROFS_FS=y
+CONFIG_F2FS_FS=y
+CONFIG_SECURITY_SELINUX_DEVELOP=y
+# OHOS does not use Android's AID_INET socket gating
+# CONFIG_ANDROID_PARANOID_NETWORK is not set
+# persistent logs for bring-up (read back from TWRP/LineageOS: /sys/fs/pstore)
+CONFIG_PSTORE=y
+CONFIG_PSTORE_CONSOLE=y
+CONFIG_PSTORE_PMSG=y
+CONFIG_PSTORE_RAM=y
+CONFIG_DEVTMPFS=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_MEMCG=y
+CONFIG_OHOS_BRINGUP_NOREBOOT=y
+CONFIG_OHOS_BRINGUP_PERMISSIVE=y
+# OHOS init creates /dev/binder from uevents; binderfs would hide the misc devices
+# CONFIG_ANDROID_BINDERFS is not set
+CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"

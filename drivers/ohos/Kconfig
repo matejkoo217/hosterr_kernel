@@ -1,0 +1,22 @@
+menu "OpenHarmony / HarmonyOS userspace support"
+
+config OHOS_DM_PARTNAME
+	bool "Report device-mapper device names as PARTNAME in uevents"
+	depends on BLK_DEV_DM=y
+	default n
+	help
+	  OpenHarmony init creates /dev/block/by-name links only from the
+	  PARTNAME uevent variable. Exposing the dm name lets logical
+	  partitions mapped from the Android super partition be found
+	  by name (system, vendor, chip_prod, sys_prod, ...).
+
+config OHOS_BRINGUP_NOREBOOT
+	bool "Allow refusing HarmonyOS init 'panic' reboots (hmos.noreboot=1)"
+	default n
+
+config OHOS_BRINGUP_PERMISSIVE
+	bool "Allow forcing SELinux permissive (hmos.permissive=1)"
+	depends on SECURITY_SELINUX_DEVELOP
+	default n
+
+endmenu
